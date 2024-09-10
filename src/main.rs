@@ -1,7 +1,9 @@
 use std::{error::Error, process::Command};
 
 pub mod node;
+use bytes::Bytes;
 use node::node::{node_service_client::NodeServiceClient, SetRequest};
+use sha2::{Digest, Sha256};
 use tonic::Request;
 
 #[tokio::main]
