@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    env,
+    sync::Arc,
+};
 
 use itertools::Itertools;
 use sha2::{Digest, Sha256};
@@ -8,7 +12,6 @@ use tokio::{
     time::{interval, Duration},
 };
 use tonic::{
-    client,
     transport::{Channel, Server},
     Request, Response, Status,
 };
@@ -32,7 +35,7 @@ pub struct Node {
     data: Arc<RwLock<BTreeMap<Vec<u8>, String>>>,
     // TODO: whenever theres a change to pred or succ, we need to do data splits
     pred: Arc<RwLock<(Vec<u8>, String)>>,
-    succ: Arc<RwLock<BTreeMap<Vec<u8>, NodeServiceClient<Channel>>>>,
+    succ: Arc<RwLock<VecDeque<(Vec<u8>, NodeServiceClient<Channel>)>>>,
 }
 
 #[tonic::async_trait]
@@ -56,8 +59,8 @@ impl NodeService for Node {
             // PERF: i kinda feel like we're holding on to the client for a while here
             false => {
                 let mut succ_lock = self.succ.write().await;
-                let mut first_succ = succ_lock.first_entry().unwrap();
-                let succ_write = first_succ.get_mut();
+                let first_succ = succ_lock.front_mut().unwrap();
+                let succ_write = &mut first_succ.1;
 
                 succ_write
                     .set(Request::new(SetRequest {
@@ -92,8 +95,8 @@ impl NodeService for Node {
             // PERF: i kinda feel like we're holding on to the client for a while here
             false => {
                 let mut succ_lock = self.succ.write().await;
-                let mut first_succ = succ_lock.first_entry().unwrap();
-                let succ_write = first_succ.get_mut();
+                let first_succ = succ_lock.front_mut().unwrap();
+                let succ_write = &mut first_succ.1;
 
                 succ_write.get(Request::new(request_message)).await
             }
@@ -121,8 +124,8 @@ impl NodeService for Node {
             }
             false => {
                 let mut succ_lock = self.succ.write().await;
-                let mut first_succ = succ_lock.first_entry().unwrap();
-                let succ_write = first_succ.get_mut();
+                let first_succ = succ_lock.front_mut().unwrap();
+                let succ_write = &mut first_succ.1;
 
                 succ_write.join(Request::new(request_message)).await
             }
@@ -136,12 +139,53 @@ impl NodeService for Node {
             hash: pred_read.0.clone(),
         }))
     }
+
+    async fn notify(
+        &self,
+        request: Request<NotifyRequest>,
+    ) -> Result<Response<NotifyResponse>, Status> {
+        let request_message = request.into_inner();
+        let is_pred = {
+            let pred_read = self.pred.read().await;
+            pred_read.0.is_empty() || self.within_range(&request_message.hash).await
+        };
+        let response_message = match is_pred {
+            true => {
+                let mut pred_write = self.pred.write().await;
+                let mut data_write = self.data.write().await;
+                let out = match request_message.hash > self.id {
+                    true => {
+                        let first_chunk = data_write.split_off(key)
+                        todo!()
+                    }
+                    false => {
+                        let keeping = data_write.split_off(&request_message.hash);
+                        let to_send = data_write.clone();
+                        *data_write = keeping;
+
+                        NotifyResponse {
+                            has_data: Some(notify_response::HasData::Data(Data {
+                                keys: to_send.clone().into_keys().collect_vec(),
+                                vals: to_send.clone().into_values().collect_vec(),
+                            })),
+                        }
+                    }
+                };
+                pred_write.0 = request_message.hash;
+                pred_write.1 = request_message.addr;
+                out
+            }
+            false => NotifyResponse { has_data: None },
+        };
+
+        Ok(Response::new(response_message))
+    }
 }
 
 impl Node {
     pub fn new(
         addr: String,
-        succ: Arc<RwLock<BTreeMap<Vec<u8>, NodeServiceClient<Channel>>>>,
+        succ: Arc<RwLock<VecDeque<(Vec<u8>, NodeServiceClient<Channel>)>>>,
         data: Arc<RwLock<BTreeMap<Vec<u8>, String>>>,
     ) -> Self {
         let mut hasher = Sha256::new();
@@ -186,6 +230,7 @@ impl Node {
         let id = self.id.clone();
         let addr = self.addr.clone();
         let data = self.data.clone();
+        let pred = self.pred.clone();
 
         tokio::spawn(async move {
             // stabilize
@@ -193,14 +238,14 @@ impl Node {
             loop {
                 interval.tick().await;
                 let mut succ_lock = succ.write().await;
-                if let Some(mut first_succ) = succ_lock.first_entry() {
-                    let succ_write = first_succ.get_mut();
+                if let Some(first_succ) = succ_lock.front_mut() {
+                    let succ_write = &mut first_succ.1;
                     let pred = succ_write.pred(Request::new(PredRequest {})).await.unwrap();
                     let pred_data = pred.into_inner();
 
                     // check if its between this node and the successor
                     let in_range = {
-                        let succ_hash = first_succ.key();
+                        let succ_hash = &first_succ.0;
                         if succ_hash < &id {
                             &pred_data.hash < succ_hash || &pred_data.hash > &id
                         } else {
@@ -210,16 +255,16 @@ impl Node {
 
                     let notify_message = match in_range {
                         true => {
-                            succ_lock.pop_first().unwrap();
-
                             let new_succ =
                                 NodeServiceClient::connect(format!("http://{}", pred_data.addr))
                                     .await
                                     .unwrap();
 
                             let mut data_write = data.write().await;
+                            // FIXME: we need to fix splif off calls to handle
+                            // crossing 0 boundary
                             let to_send = data_write.split_off(&pred_data.hash);
-                            succ_lock.insert(pred_data.hash, new_succ);
+                            succ_lock.push_front((pred_data.hash, new_succ));
 
                             NotifyRequest {
                                 addr: addr.clone(),
@@ -237,8 +282,8 @@ impl Node {
                         },
                     };
 
-                    let mut current_succ = succ_lock.first_entry().unwrap();
-                    let succ_client = current_succ.get_mut();
+                    let current_succ = succ_lock.front_mut().unwrap();
+                    let succ_client = &mut current_succ.1;
                     let notify_response = succ_client
                         .notify(Request::new(notify_message))
                         .await
@@ -255,7 +300,52 @@ impl Node {
                         }
                     }
                 } else {
-                    todo!()
+                    let pred_read = pred.read().await;
+                    if !pred_read.0.is_empty() {
+                        let mut new_succ =
+                            NodeServiceClient::connect(format!("http://{}", pred_read.1))
+                                .await
+                                .unwrap();
+
+                        let mut data_write = data.write().await;
+                        let first_chunk = data_write.split_off(&id);
+                        let keeping = data_write.split_off(&pred_read.0);
+                        let second_chunk = data_write.clone();
+                        *data_write = keeping;
+
+                        let notify_resp = new_succ
+                            .notify(Request::new(NotifyRequest {
+                                addr: addr.clone(),
+                                hash: id.clone(),
+                                has_data: Some(HasData::Data(Data {
+                                    keys: first_chunk
+                                        .clone()
+                                        .into_keys()
+                                        .chain(second_chunk.clone().into_keys())
+                                        .collect_vec(),
+                                    vals: first_chunk
+                                        .clone()
+                                        .into_values()
+                                        .chain(second_chunk.clone().into_values())
+                                        .collect_vec(),
+                                })),
+                            }))
+                            .await
+                            .unwrap();
+
+                        if let Some(has_data) = notify_resp.into_inner().has_data {
+                            match has_data {
+                                notify_response::HasData::Data(Data { keys, vals }) => {
+                                    let mut new_data = BTreeMap::<Vec<u8>, String>::from_iter(
+                                        keys.into_iter().zip(vals.into_iter()),
+                                    );
+                                    data_write.append(&mut new_data);
+                                }
+                            }
+                        }
+
+                        succ_lock.push_front((pred_read.0.clone(), new_succ));
+                    }
                 }
             }
         })
@@ -288,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )));
 
             let succ = Arc::new(RwLock::new(
-                BTreeMap::<Vec<u8>, NodeServiceClient<Channel>>::from_iter(
+                VecDeque::<(Vec<u8>, NodeServiceClient<Channel>)>::from_iter(
                     &mut [(
                         join_resp_data.succ_id,
                         NodeServiceClient::connect(format!("http://{}", join_resp_data.succ_ip))
@@ -302,7 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             let data = Arc::new(RwLock::new(BTreeMap::<Vec<u8>, String>::new()));
             let succ = Arc::new(RwLock::new(
-                BTreeMap::<Vec<u8>, NodeServiceClient<Channel>>::new(),
+                VecDeque::<(Vec<u8>, NodeServiceClient<Channel>)>::new(),
             ));
             (data, succ)
         }
