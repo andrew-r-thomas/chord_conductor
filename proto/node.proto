@@ -3,23 +3,61 @@ package node;
 
 service NodeService {
 	rpc Set (SetRequest) returns (SetResponse);
+	rpc Get (GetRequest) returns (GetResponse);
 	rpc Join (JoinRequest) returns (JoinResponse);
+	rpc Pred (PredRequest) returns (PredResponse);
+	rpc Notify (NotifyRequest) returns (NotifyResponse);
 }
 
 message SetRequest {
 	string key = 1;
 	string val = 2;
 }
-
-message SetResponse {}
+message SetResponse {
+	string loc = 1;
+}
 
 message JoinRequest {
 	string ip = 1;
 }
-
 message JoinResponse {
 	string succ_ip = 1;
-	repeated bytes keys = 2;
-	repeated string vals = 3;
+	bytes succ_id = 2;
+	repeated bytes keys = 3;
+	repeated string vals = 4;
+}
 
+message GetRequest {
+	oneof getter {
+		string key = 1;
+		bytes hash = 2;
+	}
+}
+message GetResponse {
+	string val = 1;
+	string loc = 2;
+}
+
+message PredRequest {}
+message PredResponse {
+	string addr = 1;
+	bytes hash = 2;
+}
+
+message Data {
+	repeated bytes keys = 1;
+	repeated string vals = 2;
+}
+
+message NotifyRequest {
+	string addr = 1;
+	bytes hash = 2;
+	oneof has_data {
+		Data data = 3;
+	}
+}
+message NotifyResponse {
+	oneof has_data {
+		Data data = 1;
+	}
 }
