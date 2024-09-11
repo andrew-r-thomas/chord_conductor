@@ -3,6 +3,7 @@ package node;
 
 service NodeService {
 	rpc Set (SetRequest) returns (SetResponse);
+	rpc Join (JoinRequest) returns (JoinResponse);
 }
 
 message SetRequest {
@@ -10,6 +11,15 @@ message SetRequest {
 	string val = 2;
 }
 
-message SetResponse {
+message SetResponse {}
+
+message JoinRequest {
+	string ip = 1;
+}
+
+message JoinResponse {
+	string succ_ip = 1;
+	repeated bytes keys = 2;
+	repeated string vals = 3;
 
 }
