@@ -183,6 +183,7 @@ name = "chord_dht"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "itertools",
  "prost",
  "sha2",
  "tokio",

@@ -1,16 +1,19 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-use bytes::Bytes;
-use tokio::{sync::mpsc::Receiver, task::JoinHandle};
-use tonic::transport::Channel;
+use itertools::Itertools;
+use tokio::sync::mpsc::Receiver;
+use tonic::{transport::Channel, Request};
 
-use crate::{node_service::node_service_client::NodeServiceClient, Command, CommandResult};
+use crate::{
+    node_service::{node_service_client::NodeServiceClient, JoinRequest, SetRequest},
+    Command, CommandResult,
+};
 
 pub struct DataManager {
     ip: String,
-    data: HashMap<Bytes, String>,
+    data: BTreeMap<Vec<u8>, String>,
     recv: Receiver<Command>,
-    pred: Option<NodeServiceClient<Channel>>,
+    succ: NodeServiceClient<Channel>,
 }
 
 impl DataManager {
@@ -20,17 +23,25 @@ impl DataManager {
                 Command::Set {
                     key,
                     val,
+                    hash,
                     local,
                     sender,
-                } => match local {
-                    true => {
-                        // TODO: logging
-                        self.data.insert(key, val);
+                } => {
+                    match local {
+                        true => {
+                            // TODO: logging
+                            self.data.insert(hash, val);
+                        }
+                        false => {
+                            // PERF: this means that every node has to rehash the key
+                            self.succ
+                                .set(Request::new(SetRequest { key, val }))
+                                .await
+                                .unwrap();
+                        }
                     }
-                    false => {
-                        panic!()
-                    }
-                },
+                    sender.send(CommandResult::Set).unwrap();
+                }
                 Command::Join {
                     ip,
                     pred,
@@ -38,12 +49,8 @@ impl DataManager {
                     hash,
                 } => match pred {
                     true => {
-                        self.pred = Some(
-                            NodeServiceClient::connect(format!("http://{}", ip))
-                                .await
-                                .unwrap(),
-                        );
-                        let (keys, vals) = self.shed_data(hash);
+                        let (keys, vals) = self.shed_data(&hash);
+
                         sender
                             .send(CommandResult::Join {
                                 ip: self.ip.clone(),
@@ -52,27 +59,45 @@ impl DataManager {
                             })
                             .unwrap();
                     }
-                    false => {}
+                    false => {
+                        let resp = self
+                            .succ
+                            .join(Request::new(JoinRequest { ip }))
+                            .await
+                            .unwrap();
+                        let resp_message = resp.into_inner();
+
+                        sender
+                            .send(CommandResult::Join {
+                                ip: resp_message.succ_ip,
+                                keys: resp_message.keys,
+                                vals: resp_message.vals,
+                            })
+                            .unwrap();
+                    }
                 },
             }
         }
     }
 
-    fn shed_data(&mut self, pred_hash: Bytes) -> (Vec<Vec<u8>>, Vec<String>) {
-        let keys = vec![];
-        let vals = vec![];
+    // PERF:
+    fn shed_data(&mut self, pred_hash: &[u8]) -> (Vec<Vec<u8>>, Vec<String>) {
+        let to_keep = self.data.split_off(pred_hash);
+        let to_shed = self.data.clone();
+        self.data = to_keep;
 
-        // TODO: this is where we use itertools sorted iterator
-
-        (keys, vals)
+        (
+            to_shed.keys().cloned().collect_vec(),
+            to_shed.values().cloned().collect_vec(),
+        )
     }
 
-    pub fn new(ip: String, recv: Receiver<Command>) -> Self {
+    pub fn new(ip: String, recv: Receiver<Command>, succ: NodeServiceClient<Channel>) -> Self {
         Self {
-            data: HashMap::<Bytes, String>::new(),
+            data: BTreeMap::<Vec<u8>, String>::new(),
             recv,
-            pred: None,
             ip,
+            succ,
         }
     }
 }

@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use data_manager::DataManager;
 use sha2::{Digest, Sha256};
 use tokio::sync::{
@@ -13,6 +12,7 @@ mod node_service {
     tonic::include_proto!("node");
 }
 use node_service::{
+    node_service_client::NodeServiceClient,
     node_service_server::{NodeService, NodeServiceServer},
     JoinRequest, JoinResponse, SetRequest, SetResponse,
 };
@@ -20,23 +20,23 @@ pub mod data_manager;
 
 #[derive(Debug)]
 pub struct Node {
-    id: Bytes,
-    succ: Arc<RwLock<Bytes>>,
-    pred: Arc<RwLock<Bytes>>,
+    id: Vec<u8>,
+    pred: Arc<RwLock<Vec<u8>>>,
     sender: Sender<Command>,
 }
 
 pub enum Command {
     Set {
-        key: Bytes,
+        key: String,
         val: String,
+        hash: Vec<u8>,
         local: bool,
         sender: oneshot::Sender<CommandResult>,
     },
     Join {
-        ip: String,
         pred: bool,
-        hash: Bytes,
+        hash: Vec<u8>,
+        ip: String,
         sender: oneshot::Sender<CommandResult>,
     },
 }
@@ -57,21 +57,24 @@ impl NodeService for Node {
         let request_message = request.into_inner();
         let mut hasher = Sha256::new();
         hasher.update(request_message.key.as_bytes());
-        let hash = Bytes::from(hasher.finalize().to_vec());
+        let hash = hasher.finalize().to_vec();
 
         let local = self.within_range(&hash);
         let (resp_send, resp_recv) = oneshot::channel::<CommandResult>();
         let command = Command::Set {
-            key: hash,
+            key: request_message.key,
             val: request_message.val,
+            hash,
             local,
             sender: resp_send,
         };
 
         self.sender.send(command).await.unwrap();
-
-        // TODO: need to get confirmation from manager
-        Ok(Response::new(SetResponse {}))
+        let resp = resp_recv.await.unwrap();
+        match resp {
+            CommandResult::Set => Ok(Response::new(SetResponse {})),
+            _ => todo!(),
+        }
     }
 
     async fn join(&self, request: Request<JoinRequest>) -> Result<Response<JoinResponse>, Status> {
@@ -79,16 +82,14 @@ impl NodeService for Node {
 
         let mut hasher = Sha256::new();
         hasher.update(request_message.ip.as_bytes());
-        let hash = Bytes::from(hasher.finalize().to_vec());
+        let hash = hasher.finalize().to_vec();
 
         let (resp_send, resp_recv) = oneshot::channel::<CommandResult>();
 
         let command: Command;
         if self.within_range(&hash) {
-            // TODO: maybe move this to manager
+            // TODO: probably move this to manager
             *self.pred.write().unwrap() = hash.clone();
-            // TODO: we need to give the calling node its starting data
-
             command = Command::Join {
                 ip: request_message.ip,
                 pred: true,
@@ -96,7 +97,12 @@ impl NodeService for Node {
                 hash,
             };
         } else {
-            todo!()
+            command = Command::Join {
+                ip: request_message.ip,
+                pred: false,
+                sender: resp_send,
+                hash,
+            };
         }
 
         self.sender.send(command).await.unwrap();
@@ -121,24 +127,22 @@ impl Node {
     pub fn new(ip: String, sender: Sender<Command>) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(ip.as_bytes());
-        let id = Bytes::from(hasher.finalize().to_vec());
+        let id = hasher.finalize().to_vec();
         Self {
             sender,
-            succ: Arc::new(RwLock::new(id.clone())),
             pred: Arc::new(RwLock::new(id.clone())),
             id,
         }
     }
 
-    pub fn within_range(&self, key: &Bytes) -> bool {
+    pub fn within_range(&self, key: &[u8]) -> bool {
         // PERF: there is only one node that crosses this boundary,
         // and we will be doing this check a lot
         let p = self.pred.read().unwrap();
-        let p_ref = p.as_ref();
-        if p_ref >= self.id {
-            key > p_ref || key <= &self.id
+        if p.as_slice() >= self.id.as_slice() {
+            key > p.as_slice() || key <= self.id.as_slice()
         } else {
-            key <= &self.id && key > p_ref
+            key <= self.id.as_slice() && key > p.as_slice()
         }
     }
 }
@@ -152,7 +156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node = Node::new(addr_string.into(), sender.clone());
 
     let manager = tokio::spawn(async move {
-        let mut data_manager = DataManager::new(addr_string.into(), reciever);
+        // TODO: get succ addr and initial data from cli probably
+        let client = NodeServiceClient::connect(addr_string).await.unwrap();
+        let mut data_manager = DataManager::new(addr_string.into(), reciever, client);
         data_manager.start().await;
     });
 
