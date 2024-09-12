@@ -7,6 +7,7 @@ service NodeService {
 	rpc Join (JoinRequest) returns (JoinResponse);
 	rpc Pred (PredRequest) returns (PredResponse);
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
+	rpc GetState (GetStateRequest) returns (GetStateResponse);
 }
 
 message SetRequest {
@@ -60,4 +61,10 @@ message NotifyResponse {
 	oneof has_data {
 		Data data = 1;
 	}
+}
+
+message GetStateRequest {}
+message GetStateResponse {
+	string succ = 1;
+	string pred = 2;
 }
