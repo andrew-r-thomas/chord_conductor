@@ -25,18 +25,21 @@ use node_service::{
     node_service_server::{NodeService, NodeServiceServer},
     notify_request::HasData,
     notify_response, Data, GetRequest, GetResponse, GetStateRequest, GetStateResponse, JoinRequest,
-    JoinResponse, NotifyRequest, NotifyResponse, PredRequest, PredResponse, SetRequest,
-    SetResponse,
+    JoinResponse, MergeRequest, MergeResponse, NotifyRequest, NotifyResponse, PredRequest,
+    PredResponse, SetRequest, SetResponse,
 };
 
+// NOTE: for the morning, the next steps are to fix the erros from adding the
+// option, and then try to get a basic "add node" working in the client
+// then make that guys site
 #[derive(Debug)]
 pub struct Node {
     addr: String,
     id: Vec<u8>,
     data: Arc<RwLock<BTreeMap<Vec<u8>, String>>>,
     // TODO: whenever theres a change to pred or succ, we need to do data splits
-    pred: Arc<RwLock<PredHandle>>,
-    succ: Arc<RwLock<VecDeque<SuccHandle>>>,
+    pred: Arc<RwLock<Option<PredHandle>>>,
+    succ: Arc<RwLock<Option<SuccHandle>>>,
 }
 
 #[derive(Debug)]
@@ -74,9 +77,7 @@ impl NodeService for Node {
             }
             // PERF: i kinda feel like we're holding on to the client for a while here
             false => {
-                let mut succ_lock = self.succ.write().await;
-                let first_succ = succ_lock.front_mut().unwrap();
-                let succ_write = &mut first_succ.client;
+                let succ_write = &mut self.succ.write().await.client;
 
                 succ_write
                     .set(Request::new(SetRequest {
@@ -113,10 +114,7 @@ impl NodeService for Node {
             }
             // PERF: i kinda feel like we're holding on to the client for a while here
             false => {
-                let mut succ_lock = self.succ.write().await;
-                let first_succ = succ_lock.front_mut().unwrap();
-                let succ_write = &mut first_succ.client;
-
+                let succ_write = &mut self.succ.write().await.client;
                 succ_write.get(Request::new(request_message)).await
             }
         }
@@ -150,10 +148,7 @@ impl NodeService for Node {
                 }))
             }
             false => {
-                let mut succ_lock = self.succ.write().await;
-                let first_succ = succ_lock.front_mut().unwrap();
-                let succ_write = &mut first_succ.client;
-
+                let succ_write = &mut self.succ.write().await.client;
                 succ_write.join(Request::new(request_message)).await
             }
         }
@@ -219,21 +214,59 @@ impl NodeService for Node {
     ) -> Result<Response<GetStateResponse>, Status> {
         let succ_read = self.succ.read().await;
         let pred_read = self.pred.read().await;
-        let succ = match succ_read.front() {
-            Some(s) => s.addr.clone(),
-            None => String::from("None"),
-        };
+
         Ok(Response::new(GetStateResponse {
-            succ,
+            succ: succ_read.addr.clone(),
             pred: pred_read.addr.clone(),
         }))
+    }
+
+    async fn merge(
+        &self,
+        request: Request<MergeRequest>,
+    ) -> Result<Response<MergeResponse>, Status> {
+        let request_message = request.into_inner();
+
+        let join_data = {
+            let mut temp_client =
+                NodeServiceClient::connect(format!("http:/{}", request_message.join_addr))
+                    .await
+                    .unwrap();
+            let join_resp = temp_client
+                .join(Request::new(JoinRequest {
+                    ip: self.addr.clone(),
+                }))
+                .await
+                .unwrap();
+            join_resp.into_inner()
+        };
+
+        let mut new_data = BTreeMap::<Vec<u8>, String>::from_iter(
+            join_data.keys.into_iter().zip(join_data.vals.into_iter()),
+        );
+        {
+            let mut data_write = self.data.write().await;
+            data_write.append(&mut new_data);
+        }
+
+        let succ_client = NodeServiceClient::connect(format!("http://{}", join_data.succ_ip))
+            .await
+            .unwrap();
+        {
+            let mut succ_write = self.succ.write().await;
+            succ_write.addr = join_data.succ_ip;
+            succ_write.hash = join_data.succ_id;
+            succ_write.client = succ_client;
+        }
+
+        Ok(Response::new(MergeResponse {}))
     }
 }
 
 impl Node {
     pub fn new(
         addr: String,
-        succ: Arc<RwLock<VecDeque<SuccHandle>>>,
+        succ: Arc<RwLock<SuccHandle>>,
         data: Arc<RwLock<BTreeMap<Vec<u8>, String>>>,
     ) -> Self {
         let mut hasher = Sha256::new();
@@ -264,16 +297,19 @@ impl Node {
             let mut interval = interval(stabilize_interval);
             loop {
                 interval.tick().await;
-                let mut succ_lock = succ.write().await;
-                if let Some(first_succ) = succ_lock.front_mut() {
-                    let succ_write = &mut first_succ.client;
-                    let pred = succ_write.pred(Request::new(PredRequest {})).await.unwrap();
+                let mut succ_write = succ.write().await;
+                if !succ_write.addr.is_empty() {
+                    let succ_client = &mut succ_write.client;
+                    let pred = succ_client
+                        .pred(Request::new(PredRequest {}))
+                        .await
+                        .unwrap();
                     let pred_data = pred.into_inner();
 
                     // check if its between this node and the successor
                     let in_range = Node::within_range(
                         pred_data.hash.as_slice(),
-                        first_succ.hash.as_slice(),
+                        succ_write.hash.as_slice(),
                         id.as_slice(),
                     );
 
@@ -288,11 +324,11 @@ impl Node {
                             // FIXME: we need to fix splif off calls to handle
                             // crossing 0 boundary
                             let to_send = data_write.split_off(&pred_data.hash);
-                            succ_lock.push_front(SuccHandle {
+                            *succ_write = SuccHandle {
                                 addr: pred_data.addr,
                                 hash: pred_data.hash,
                                 client: new_succ,
-                            });
+                            };
 
                             NotifyRequest {
                                 addr: addr.clone(),
@@ -310,8 +346,7 @@ impl Node {
                         },
                     };
 
-                    let current_succ = succ_lock.front_mut().unwrap();
-                    let succ_client = &mut current_succ.client;
+                    let succ_client = &mut succ_write.client;
                     let notify_response = succ_client
                         .notify(Request::new(notify_message))
                         .await
@@ -372,11 +407,11 @@ impl Node {
                             }
                         }
 
-                        succ_lock.push_front(SuccHandle {
+                        *succ_write = SuccHandle {
                             addr: pred_read.addr.clone(),
                             hash: pred_read.hash.clone(),
                             client: new_succ,
-                        });
+                        };
                     }
                 }
             }
@@ -471,18 +506,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .zip(join_resp_data.vals.into_iter()),
             )));
 
-            let succ = Arc::new(RwLock::new(VecDeque::<SuccHandle>::from_iter(
-                &mut [SuccHandle {
-                    addr: join_resp_data.succ_ip.clone(),
-                    hash: join_resp_data.succ_id,
-                    client: NodeServiceClient::connect(format!(
-                        "http://{}",
-                        join_resp_data.succ_ip
-                    ))
+            let succ = Arc::new(RwLock::new(SuccHandle {
+                addr: join_resp_data.succ_ip.clone(),
+                hash: join_resp_data.succ_id,
+                client: NodeServiceClient::connect(format!("http://{}", join_resp_data.succ_ip))
                     .await?,
-                }]
-                .into_iter(),
-            )));
+            }));
             (data, succ)
         }
         None => {

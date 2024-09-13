@@ -8,6 +8,7 @@ service NodeService {
 	rpc Pred (PredRequest) returns (PredResponse);
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
 	rpc GetState (GetStateRequest) returns (GetStateResponse);
+	rpc Merge (MergeRequest) returns (MergeResponse);
 }
 
 message SetRequest {
@@ -68,3 +69,8 @@ message GetStateResponse {
 	string succ = 1;
 	string pred = 2;
 }
+
+message MergeRequest {
+	string join_addr = 1;
+}
+message MergeResponse {}
