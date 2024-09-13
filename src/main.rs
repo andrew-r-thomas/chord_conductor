@@ -24,7 +24,7 @@ use tonic::Request;
 mod node {
     tonic::include_proto!("node");
 }
-use node::{node_service_client::NodeServiceClient, GetStateRequest, MergeRequest};
+use node::{node_service_client::NodeServiceClient, GetStateRequest};
 
 #[tokio::main]
 async fn main() {
@@ -69,29 +69,27 @@ struct Client {
 
 impl Client {
     pub fn spawn(addr: String, join_addr: Option<String>, send: UnboundedSender<Message>) -> Self {
+        println!("this is the addr: {}", addr);
         Self {
             addr: addr.clone(),
             join_handle: tokio::spawn(async move {
-                let _node = Command::new("./target/debug/node")
-                    .kill_on_drop(true)
-                    .args(&[addr.clone()])
-                    .spawn()
-                    .expect("failed to start node");
+                let _node = match join_addr {
+                    Some(ja) => Command::new("./target/debug/node")
+                        .kill_on_drop(true)
+                        .args(&[addr.clone(), ja])
+                        .spawn()
+                        .expect("failed to start node"),
+                    None => Command::new("./target/debug/node")
+                        .kill_on_drop(true)
+                        .args(&[addr.clone()])
+                        .spawn()
+                        .expect("failed to start node"),
+                };
                 // TODO: maybe a mechanism for knowing when a node is ready
-                sleep(Duration::from_millis(1000)).await;
+                sleep(Duration::from_millis(2000)).await;
                 let mut client = NodeServiceClient::connect(format!("http://{}", addr.clone()))
                     .await
                     .unwrap();
-
-                match join_addr {
-                    Some(ja) => {
-                        client
-                            .merge(Request::new(MergeRequest { join_addr: ja }))
-                            .await
-                            .unwrap();
-                    }
-                    None => {}
-                }
 
                 let mut interval = interval(Duration::from_millis(500));
                 loop {
