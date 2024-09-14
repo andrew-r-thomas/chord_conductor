@@ -15,6 +15,7 @@ use axum::{
 use axum_extra::TypedHeader;
 use futures::{channel::oneshot, stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncReadExt,
     net::TcpListener,
@@ -65,6 +66,7 @@ enum WsTextMessage {
 #[derive(Serialize, Deserialize, Debug)]
 struct NodeState {
     addr: String,
+    hash: Vec<u8>,
     pred: String,
     succ: String,
 }
@@ -159,8 +161,10 @@ async fn handle_socket(mut socket: WebSocket) {
                     addr: c.addr.clone(),
                     pred: get_state_data.pred,
                     succ: get_state_data.succ,
+                    hash: get_state_data.hash,
                 });
             }
+            nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
             ws_send
                 .send(Message::Text(serde_json::to_string(&nodes).unwrap()))
                 .await

@@ -244,7 +244,11 @@ impl NodeService for Node {
             }
         };
 
-        Ok(Response::new(GetStateResponse { succ, pred }))
+        Ok(Response::new(GetStateResponse {
+            hash: self.id.clone(),
+            succ,
+            pred,
+        }))
     }
 }
 
