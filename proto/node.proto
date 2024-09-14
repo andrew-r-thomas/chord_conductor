@@ -2,8 +2,8 @@ syntax = "proto3";
 package node;
 
 service NodeService {
-	rpc Set (SetRequest) returns (SetResponse);
-	rpc Get (GetRequest) returns (GetResponse);
+	// rpc Set (SetRequest) returns (SetResponse);
+	// rpc Get (GetRequest) returns (GetResponse);
 	rpc Join (JoinRequest) returns (JoinResponse);
 	rpc Pred (PredRequest) returns (PredResponse);
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
@@ -24,8 +24,8 @@ message JoinRequest {
 message JoinResponse {
 	string succ_ip = 1;
 	bytes succ_id = 2;
-	repeated bytes keys = 3;
-	repeated string vals = 4;
+	// repeated bytes keys = 3;
+	// repeated string vals = 4;
 }
 
 message GetRequest {
@@ -53,14 +53,14 @@ message Data {
 message NotifyRequest {
 	string addr = 1;
 	bytes hash = 2;
-	oneof has_data {
-		Data data = 3;
-	}
+	// oneof has_data {
+	// 	Data data = 3;
+	// }
 }
 message NotifyResponse {
-	oneof has_data {
-		Data data = 1;
-	}
+	// oneof has_data {
+	// 	Data data = 1;
+	// }
 }
 
 message GetStateRequest {}
