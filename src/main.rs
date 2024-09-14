@@ -1,31 +1,29 @@
+use core::panic;
 use std::{
+    collections::HashMap,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{mpsc::Receiver, Arc},
+    thread,
 };
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket},
-        WebSocketUpgrade,
-    },
-    response::IntoResponse,
-    routing::get,
-    serve, Router,
+use eframe::egui;
+use egui_graphs::{DefaultEdgeShape, DefaultNodeShape, Graph, GraphView};
+use petgraph::{
+    data::Build,
+    graph::{EdgeIndex, NodeIndex},
+    stable_graph::StableGraph,
+    Directed,
 };
-use axum_extra::TypedHeader;
-use futures::{channel::oneshot, stream::StreamExt, SinkExt};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::digest::consts::False;
 use tokio::{
     io::AsyncReadExt,
-    net::TcpListener,
     process::Command,
+    runtime::Runtime,
     sync::{
         mpsc::{self, UnboundedSender},
-        RwLock,
+        oneshot, RwLock,
     },
-    task::JoinHandle,
-    time::{interval, sleep, Duration},
+    time::{interval, Duration},
 };
 use tonic::{transport::Channel, Request};
 
@@ -34,45 +32,140 @@ mod node {
 }
 use node::{node_service_client::NodeServiceClient, GetStateRequest};
 
-#[tokio::main]
-async fn main() {
-    let app = Router::new().route("/ws", get(ws_handler));
-    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    serve(listener, app).await.unwrap();
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    user_agent: Option<TypedHeader<headers::UserAgent>>,
-) -> impl IntoResponse {
-    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
-        user_agent.to_string()
-    } else {
-        String::from("Unknown browser")
-    };
-
-    println!("`{user_agent}` connected.");
-
-    ws.on_upgrade(move |socket| handle_socket(socket))
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-enum WsTextMessage {
-    Start,
+enum GuiMessage {
+    Start(egui::Context),
     AddNode,
-    Other,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct NodeState {
-    addr: String,
-    hash: Vec<u8>,
-    pred: String,
-    succ: String,
+fn main() -> eframe::Result {
+    let runtime = Runtime::new().unwrap();
+    let _ = runtime.enter();
+    let (gui_send, mut rt_recv) = mpsc::unbounded_channel::<GuiMessage>();
+    let (rt_send, gui_recv) = std::sync::mpsc::channel::<StableGraph<(), ()>>();
+
+    thread::spawn(move || {
+        runtime.block_on(async {
+            let clients = Arc::new(RwLock::<Vec<Client>>::new(vec![]));
+
+            let (start_send, start_recv) = oneshot::channel::<egui::Context>();
+            let poll_clients = clients.clone();
+            let poll_task = tokio::spawn(async move {
+                let ctx = start_recv.await.unwrap();
+                let mut interval = interval(Duration::from_millis(1000));
+
+                loop {
+                    interval.tick().await;
+                    let mut poll_clients_write = poll_clients.write().await;
+                    // let nodes = HashMap::new();
+                    let mut g: StableGraph<(), ()> = StableGraph::new();
+
+                    // for c in poll_clients_write.iter_mut() {
+                    //     let get_state_resp = c
+                    //         .client
+                    //         .get_state(Request::new(GetStateRequest {}))
+                    //         .await
+                    //         .unwrap();
+                    //     let get_state_data = get_state_resp.into_inner();
+                    //     let succ = match get_state_data.succ.is_empty() {
+                    //         true => None,
+                    //         false => Some(get_state_data.succ),
+                    //     };
+                    // }
+
+                    let a = g.add_node(());
+                    let b = g.add_node(());
+                    g.add_edge(a, b, ());
+
+                    rt_send.send(g).unwrap();
+                    ctx.request_repaint();
+                }
+            });
+
+            if let Some(GuiMessage::Start(ctx)) = rt_recv.recv().await {
+                let mut clients_write = clients.write().await;
+                let new_client = Client::spawn(None).await;
+                clients_write.push(new_client);
+                start_send.send(ctx).unwrap();
+            }
+
+            while let Some(gui_message) = rt_recv.recv().await {
+                match gui_message {
+                    GuiMessage::AddNode => {
+                        let mut client_write = clients.write().await;
+                        let new_client =
+                            Client::spawn(Some(client_write.first().unwrap().addr.clone())).await;
+                        client_write.push(new_client);
+                    }
+                    _ => {
+                        println!("ahhhh!!!");
+                        panic!();
+                    }
+                }
+            }
+            poll_task.await.unwrap();
+        });
+    });
+
+    eframe::run_native(
+        "Conductor",
+        eframe::NativeOptions {
+            vsync: false,
+            ..Default::default()
+        },
+        Box::new(|_cc| Ok(Box::new(Gui::new(gui_send, gui_recv)))),
+    )
+}
+
+struct Gui {
+    send: UnboundedSender<GuiMessage>,
+    recv: Receiver<StableGraph<(), ()>>,
+    graph: Graph<(), (), Directed>,
+    nodes: HashMap<String, (NodeIndex, Option<EdgeIndex>)>,
+}
+
+impl Gui {
+    pub fn new(send: UnboundedSender<GuiMessage>, recv: Receiver<StableGraph<(), ()>>) -> Self {
+        let mut g: StableGraph<(), ()> = StableGraph::new();
+        g.add_node(());
+        let graph = Graph::from(&g);
+        Self {
+            send,
+            recv,
+            graph,
+            nodes: HashMap::new(),
+        }
+    }
+}
+
+impl eframe::App for Gui {
+    fn update(&mut self, ctx: &eframe::egui::Context, frame: &mut eframe::Frame) {
+        if let Ok(g) = self.recv.try_recv() {
+            self.graph = Graph::from(&g);
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Conductor");
+            if ui.button("start").clicked() {
+                self.send.send(GuiMessage::Start(ctx.clone())).unwrap()
+            }
+            if ui.button("add node").clicked() {
+                self.send.send(GuiMessage::AddNode).unwrap();
+            }
+            ui.add(&mut GraphView::<
+                _,
+                _,
+                _,
+                _,
+                DefaultNodeShape,
+                DefaultEdgeShape,
+            >::new(&mut self.graph));
+        });
+    }
 }
 
 struct Client {
     addr: String,
+    succ: Option<String>,
     client: NodeServiceClient<Channel>,
 }
 
@@ -97,81 +190,10 @@ impl Client {
             .await
             .unwrap();
         println!("connected to client: {}", addr.clone());
-        Self { addr, client }
+        Self {
+            addr,
+            client,
+            succ: None,
+        }
     }
-}
-
-async fn handle_socket(mut socket: WebSocket) {
-    socket.send(Message::Ping(vec![])).await.unwrap();
-    socket.recv().await.unwrap().unwrap();
-
-    let (mut ws_send, mut ws_recv) = socket.split();
-
-    // TODO: this rwlock is maybe not the right thing
-    let clients = Arc::new(RwLock::new(vec![]));
-    let recv_clients = clients.clone();
-    let send_clients = clients.clone();
-    let recv_task = tokio::spawn(async move {
-        let mut started = false;
-
-        while let Some(Ok(Message::Text(msg_text))) = ws_recv.next().await {
-            let ws_text_message: WsTextMessage = serde_json::from_str(&msg_text).unwrap();
-            match ws_text_message {
-                WsTextMessage::Start => {
-                    if started {
-                        continue;
-                    }
-
-                    println!("start called");
-                    started = true;
-
-                    let client_handle = Client::spawn(None).await;
-                    recv_clients.write().await.push(client_handle);
-                }
-                WsTextMessage::AddNode => {
-                    if !started {
-                        panic!();
-                    }
-
-                    let mut clients_lock = recv_clients.write().await;
-                    let client_handle =
-                        Client::spawn(Some(clients_lock.first().unwrap().addr.clone())).await;
-                    clients_lock.push(client_handle);
-                }
-                _ => panic!(),
-            }
-        }
-    });
-
-    let send_task = tokio::spawn(async move {
-        let mut interval = interval(Duration::from_millis(500));
-        let mut nodes = vec![];
-        loop {
-            interval.tick().await;
-            let mut clients_lock = send_clients.write().await;
-            nodes.clear();
-            for c in clients_lock.iter_mut() {
-                let get_state_resp = c
-                    .client
-                    .get_state(Request::new(GetStateRequest {}))
-                    .await
-                    .unwrap();
-                let get_state_data = get_state_resp.into_inner();
-                nodes.push(NodeState {
-                    addr: c.addr.clone(),
-                    pred: get_state_data.pred,
-                    succ: get_state_data.succ,
-                    hash: get_state_data.hash,
-                });
-            }
-            nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
-            ws_send
-                .send(Message::Text(serde_json::to_string(&nodes).unwrap()))
-                .await
-                .unwrap();
-        }
-    });
-
-    recv_task.await.unwrap();
-    send_task.await.unwrap();
 }
