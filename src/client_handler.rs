@@ -1,38 +1,70 @@
-use std::process::Stdio;
+use std::{process::Stdio, time::Duration};
 
-use tokio::{io::AsyncReadExt, process::Command};
-use tonic::transport::Channel;
+use rand::seq::SliceRandom;
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpListener,
+    process::Command,
+    time::{interval, sleep},
+};
+use tonic::{transport::Channel, Request};
 
-use crate::node::node_service_client::NodeServiceClient;
+use crate::{
+    node::{node_service_client::NodeServiceClient, set_request::Setter},
+    Haiku,
+};
 
+#[derive(Debug)]
 pub struct ClientHandler {
     pub addr: String,
     pub client: NodeServiceClient<Channel>,
 }
 
 impl ClientHandler {
-    pub async fn spawn(join_addr: Option<String>) -> Self {
-        let mut node = match join_addr {
+    pub async fn spawn(join_addr: Option<String>, data: Vec<Haiku>) -> Self {
+        let addr = {
+            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let mut _node = match join_addr {
             Some(ja) => Command::new("./target/debug/node")
-                .args(&[ja])
+                .args(&[addr.to_string(), ja])
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("failed to start node"),
             None => Command::new("./target/debug/node")
+                .args(&[addr.to_string()])
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("failed to start node"),
         };
-        let mut stdout = node.stdout.take().unwrap();
-        let mut bytes = [0; 13];
-        stdout.read(&mut bytes).await.unwrap();
-        let addr = String::from_utf8(bytes.to_vec()).unwrap();
+        sleep(Duration::from_millis(2000)).await;
+
         let client = NodeServiceClient::connect(format!("http://{}", addr.clone()))
             .await
             .unwrap();
-        println!("connected to client: {}", addr.clone());
-        let poll_task = tokio::spawn(async move {});
-        let client_sim_task = tokio::spawn(async move {});
-        Self { addr, client }
+
+        let mut task_client = client.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_millis(1000));
+            loop {
+                interval.tick().await;
+                let haiku = { data.choose(&mut rand::thread_rng()).unwrap() };
+                let thing = task_client
+                    .set(Request::new(crate::node::SetRequest {
+                        val: haiku.val.clone(),
+                        setter: Some(Setter::Key(haiku.key.clone())),
+                    }))
+                    .await;
+            }
+        });
+
+        Self {
+            addr: addr.to_string(),
+            client,
+        }
     }
 }

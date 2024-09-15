@@ -1,5 +1,3 @@
-use std::{process::Stdio, sync::Arc};
-
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -12,13 +10,15 @@ use axum::{
 use axum_extra::TypedHeader;
 use client_handler::ClientHandler;
 use futures::{stream::StreamExt, SinkExt};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tokio::{
+    fs::File,
     io::AsyncReadExt,
     net::TcpListener,
     process::Command,
-    sync::RwLock,
-    time::{interval, Duration},
+    sync::{mpsc, oneshot, RwLock},
+    time::{interval, sleep, Duration},
 };
 use tonic::{transport::Channel, Request};
 
@@ -51,23 +51,35 @@ async fn ws_handler(
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-enum WsTextMessage {
-    Start,
-    AddNode,
-    ClientSim,
+enum WsRecvMessage {
+    Start { nodes: usize },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum WsSendMessage {
+    NodeData {
+        addr: String,
+        succ: Option<String>,
+        data_len: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct NodeState {
     addr: String,
     hash: Vec<u8>,
-    pred: String,
     succ: String,
 }
 #[derive(Serialize, Deserialize, Debug)]
 struct Nodes {
     kind: String,
     data: Vec<NodeState>,
+    len: u32,
+}
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Haiku {
+    key: String,
+    val: String,
 }
 
 async fn handle_socket(mut socket: WebSocket) {
@@ -75,65 +87,68 @@ async fn handle_socket(mut socket: WebSocket) {
     socket.recv().await.unwrap().unwrap();
 
     let (mut ws_send, mut ws_recv) = socket.split();
+    let (message_send, message_recv) = mpsc::channel::<WsSendMessage>(100);
+    let (poll_send, poll_recv) = oneshot::channel::<Vec<ClientHandler>>();
 
-    // TODO: this rwlock is maybe not the right thing
-    let clients = Arc::new(RwLock::new(vec![]));
-    let recv_clients = clients.clone();
-    let send_clients = clients.clone();
     let recv_task = tokio::spawn(async move {
-        let mut started = false;
-
-        while let Some(Ok(Message::Text(msg_text))) = ws_recv.next().await {
-            let ws_text_message: WsTextMessage = serde_json::from_str(&msg_text).unwrap();
+        if let Some(Ok(Message::Text(msg_text))) = ws_recv.next().await {
+            let ws_text_message: WsRecvMessage = serde_json::from_str(&msg_text).unwrap();
             match ws_text_message {
-                WsTextMessage::Start => {
-                    if started {
-                        continue;
+                WsRecvMessage::Start { nodes } => {
+                    let mut haikus = vec![];
+                    let mut rdr = csv_async::AsyncReader::from_reader(
+                        File::open("./haikus.csv").await.unwrap(),
+                    );
+                    let mut records = rdr.records();
+                    while let Some(Ok(haiku)) = records.next().await {
+                        haikus.push(Haiku {
+                            val: haiku[0].into(),
+                            key: haiku[1].into(),
+                        });
                     }
+                    let haiku_num = haikus.len();
 
-                    println!("start called");
-                    started = true;
-
-                    let client_handle = ClientHandler::spawn(None).await;
-                    recv_clients.write().await.push(client_handle);
-                }
-                WsTextMessage::AddNode => {
-                    if !started {
-                        panic!();
+                    let mut clients = vec![];
+                    let mut prev_addr = None;
+                    for _ in 0..nodes {
+                        let node = ClientHandler::spawn(
+                            prev_addr,
+                            haikus.drain(0..haiku_num / nodes).collect_vec(),
+                        )
+                        .await;
+                        prev_addr = Some(node.addr.clone());
+                        clients.push(node);
                     }
-
-                    let mut clients_lock = recv_clients.write().await;
-                    let client_handle =
-                        ClientHandler::spawn(Some(clients_lock.first().unwrap().addr.clone()))
-                            .await;
-                    clients_lock.push(client_handle);
-                }
-                WsTextMessage::ClientSim => {
-                    if !started {
-                        panic!();
-                    }
+                    poll_send.send(clients).unwrap();
                 }
             }
         }
     });
 
+    /*
+     * ok so we want to poll the clients periodically,
+     * and then we want to make the nodes do stuff periodically with the clients
+     */
+
     let send_task = tokio::spawn(async move {
-        let mut interval = interval(Duration::from_millis(100));
+        let mut interval = interval(Duration::from_millis(500));
+        let mut clients = poll_recv.await.unwrap();
         let mut nodes = vec![];
+
         loop {
             interval.tick().await;
-            let mut clients_lock = send_clients.write().await;
             nodes.clear();
-            for c in clients_lock.iter_mut() {
+            let mut records = 0;
+            for c in clients.iter_mut() {
                 let get_state_resp = c
                     .client
                     .get_state(Request::new(GetStateRequest {}))
                     .await
                     .unwrap();
                 let get_state_data = get_state_resp.into_inner();
+                records += get_state_data.data_len;
                 nodes.push(NodeState {
                     addr: c.addr.clone(),
-                    pred: get_state_data.pred,
                     succ: get_state_data.succ,
                     hash: get_state_data.hash,
                 });
@@ -144,6 +159,7 @@ async fn handle_socket(mut socket: WebSocket) {
                     serde_json::to_string(&Nodes {
                         kind: "node data".into(),
                         data: nodes.clone(),
+                        len: records,
                     })
                     .unwrap(),
                 ))

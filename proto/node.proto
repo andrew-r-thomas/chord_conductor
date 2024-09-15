@@ -66,4 +66,5 @@ message GetStateResponse {
 	bytes hash = 1;
 	string succ = 2;
 	string pred = 3;
+	uint32 data_len = 4;
 }

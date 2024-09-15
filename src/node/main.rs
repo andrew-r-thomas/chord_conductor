@@ -308,6 +308,7 @@ impl NodeService for Node {
     ) -> Result<Response<GetStateResponse>, Status> {
         let succ_read = self.succ.read().await;
         let pred_read = self.pred.read().await;
+        let data_read = self.data.read().await;
 
         // TODO: maybe just return None for empty vals
         let succ = {
@@ -330,6 +331,7 @@ impl NodeService for Node {
             hash: self.id.clone(),
             succ,
             pred,
+            data_len: data_read.len() as u32,
         }))
     }
 }
@@ -542,14 +544,13 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("started node");
     let args = env::args().collect_vec();
 
-    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let addr_string = addr.to_string();
-    println!("{}", addr_string);
+    let addr_string = args.get(1).unwrap().to_owned();
+    let listener = TcpListener::bind(addr_string.clone()).await.unwrap();
 
-    let succ = match args.get(1) {
+    let succ = match args.get(2) {
         Some(join_addr) => {
             let join_resp_data = {
                 let mut join_client =
@@ -576,13 +577,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    println!("{}", addr_string);
     let node = Node::new(
         addr_string,
         succ.clone(),
         Arc::new(RwLock::new(BTreeMap::<Vec<u8>, String>::new())),
     );
     // TODO: figure out timing
-    let stabilize_handle = node.start_periodics(Duration::from_millis(500));
+    let stabilize_handle = node.start_periodics(Duration::from_millis(100));
 
     // TODO: also figure out the orders of these awaits
     // or if we should even do them
