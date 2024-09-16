@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, sync::Arc};
+use std::{collections::BTreeMap, env, fs::File, sync::Arc};
 
 use itertools::Itertools;
 use sha2::{Digest, Sha256};
@@ -26,6 +26,7 @@ use node_service::{
     Data, GetRequest, GetResponse, GetStateRequest, GetStateResponse, JoinRequest, JoinResponse,
     NotifyRequest, NotifyResponse, PredRequest, PredResponse, SetRequest, SetResponse,
 };
+use tracing::{info, instrument};
 
 #[derive(Debug)]
 pub struct Node {
@@ -36,13 +37,13 @@ pub struct Node {
     succ: Arc<RwLock<Option<SuccHandle>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SuccHandle {
     addr: String,
     hash: Vec<u8>,
     client: NodeServiceClient<Channel>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PredHandle {
     addr: String,
     hash: Vec<u8>,
@@ -52,7 +53,9 @@ pub struct PredHandle {
 // but if it is we should try to
 #[tonic::async_trait]
 impl NodeService for Node {
+    #[instrument(skip(self))]
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        info!("called set");
         let request_message = request.into_inner();
         let hash = match request_message.setter {
             Some(Setter::Key(key)) => {
@@ -64,63 +67,63 @@ impl NodeService for Node {
             None => panic!(),
         };
 
-        let pred_read = self.pred.read().await;
-        let mut succ_write = self.succ.write().await;
-        match succ_write.is_none() {
+        info!("waiting for locks in set");
+        let pred_read = { self.pred.read().await.clone() };
+        info!("got pred read in set");
+        let mut succ_write = { self.succ.write().await.clone() };
+        info!("got succ write in set");
+
+        let resp = match succ_write.is_none() {
             true => {
+                info!("set succ is none");
                 let mut data_write = self.data.write().await;
                 data_write.insert(hash, request_message.val);
                 Ok(Response::new(SetResponse {
                     loc: self.addr.clone(),
                 }))
             }
-            false => match pred_read.is_none() {
-                true => {
-                    match Self::within_range(&hash, &succ_write.as_ref().unwrap().hash, &self.id) {
-                        true => {
-                            let mut data_write = self.data.write().await;
-                            data_write.insert(hash, request_message.val);
-                            Ok(Response::new(SetResponse {
-                                loc: self.addr.clone(),
-                            }))
-                        }
-                        false => {
-                            succ_write
-                                .as_mut()
-                                .unwrap()
-                                .client
-                                .set(Request::new(SetRequest {
-                                    val: request_message.val,
-                                    setter: Some(Setter::Hash(hash)),
+            false => {
+                info!("set succ is some");
+                match pred_read.is_none() {
+                    true => {
+                        info!("pred read is none in set");
+                        let mut data_write = self.data.write().await;
+                        data_write.insert(hash, request_message.val);
+                        Ok(Response::new(SetResponse {
+                            loc: self.addr.clone(),
+                        }))
+                    }
+                    false => {
+                        info!("pred read is some in set");
+                        match Self::within_range(&hash, &pred_read.as_ref().unwrap().hash, &self.id)
+                        {
+                            true => {
+                                info!("pred within range");
+                                let mut data_write = self.data.write().await;
+                                data_write.insert(hash, request_message.val);
+                                Ok(Response::new(SetResponse {
+                                    loc: self.addr.clone(),
                                 }))
-                                .await
+                            }
+                            false => {
+                                info!("pred not in range");
+                                succ_write
+                                    .as_mut()
+                                    .unwrap()
+                                    .client
+                                    .set(Request::new(SetRequest {
+                                        val: request_message.val,
+                                        setter: Some(Setter::Hash(hash)),
+                                    }))
+                                    .await
+                            }
                         }
                     }
                 }
-                false => {
-                    match Self::within_range(&hash, &pred_read.as_ref().unwrap().hash, &self.id) {
-                        true => {
-                            let mut data_write = self.data.write().await;
-                            data_write.insert(hash, request_message.val);
-                            Ok(Response::new(SetResponse {
-                                loc: self.addr.clone(),
-                            }))
-                        }
-                        false => {
-                            succ_write
-                                .as_mut()
-                                .unwrap()
-                                .client
-                                .set(Request::new(SetRequest {
-                                    val: request_message.val,
-                                    setter: Some(Setter::Hash(hash)),
-                                }))
-                                .await
-                        }
-                    }
-                }
-            },
-        }
+            }
+        };
+        info!("returning set");
+        resp
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -204,8 +207,8 @@ impl NodeService for Node {
         hasher.update(request_message.ip.as_bytes());
         let hash = hasher.finalize().to_vec();
 
-        let pred_read = self.pred.read().await;
-        let mut succ_write = self.succ.write().await;
+        let pred_read = { self.pred.read().await.clone() };
+        let mut succ_write = { self.succ.write().await.clone() };
 
         match succ_write.is_none() {
             true => Ok(Response::new(JoinResponse {
@@ -255,12 +258,17 @@ impl NodeService for Node {
         }
     }
 
+    #[instrument(skip(self))]
     async fn notify(
         &self,
         request: Request<NotifyRequest>,
     ) -> Result<Response<NotifyResponse>, Status> {
+        info!("notify called");
         let request_message = request.into_inner();
         let mut pred_write = self.pred.write().await;
+        info!("got pred write in notify");
+        info!("got data write in notify");
+
         match pred_write.is_none() {
             true => {
                 let mut data_write = self.data.write().await;
@@ -302,13 +310,15 @@ impl NodeService for Node {
         }
     }
 
+    #[instrument(skip(self))]
     async fn get_state(
         &self,
         _request: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
-        let succ_read = self.succ.read().await;
-        let pred_read = self.pred.read().await;
-        let data_read = self.data.read().await;
+        info!("called get state");
+        let succ_read = { self.succ.read().await.clone() };
+        let pred_read = { self.pred.read().await.clone() };
+        let len = { self.data.read().await.len() };
 
         // TODO: maybe just return None for empty vals
         let succ = {
@@ -331,7 +341,7 @@ impl NodeService for Node {
             hash: self.id.clone(),
             succ,
             pred,
-            data_len: data_read.len() as u32,
+            len: len as u32,
         }))
     }
 }
@@ -355,6 +365,7 @@ impl Node {
         }
     }
 
+    #[instrument(skip(self))]
     pub fn start_periodics(&self, stabilize_interval: Duration) -> JoinHandle<()> {
         let succ = self.succ.clone();
         let id = self.id.clone();
@@ -367,10 +378,15 @@ impl Node {
             let mut interval = interval(stabilize_interval);
             loop {
                 interval.tick().await;
+                info!("stabilizing");
                 let mut succ_write = succ.write().await;
+                info!("got succ write in stabilizing");
+                let pred_read = { pred.read().await.clone() };
+                info!("got pred read in stabilizing");
+
                 match succ_write.is_none() {
                     true => {
-                        let pred_read = pred.read().await;
+                        info!("stabilizing succ write is none");
                         match pred_read.is_none() {
                             true => {}
                             false => {
@@ -391,10 +407,10 @@ impl Node {
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut data_write = data.write().await;
                                         let mut to_append = BTreeMap::<Vec<u8>, String>::from_iter(
                                             keys.into_iter().zip(vals.into_iter()),
                                         );
+                                        let mut data_write = data.write().await;
                                         data_write.append(&mut to_append);
                                     }
                                     None => {}
@@ -408,6 +424,7 @@ impl Node {
                         }
                     }
                     false => {
+                        info!("stabilizing succ write is some");
                         let (pred_data, succ_hash) = {
                             let succ_handle = succ_write.as_mut().unwrap();
                             let succ_client = &mut succ_handle.client;
@@ -417,14 +434,17 @@ impl Node {
                                 .unwrap();
                             (pred_resp.into_inner(), succ_handle.hash.clone())
                         };
+                        info!("got pred in stabilize");
                         match Self::within_range(&pred_data.hash, &id, &succ_hash) {
                             true => {
+                                info!("pred within range");
                                 let mut succ_client = NodeServiceClient::connect(format!(
                                     "http://{}",
                                     pred_data.addr
                                 ))
                                 .await
                                 .unwrap();
+                                info!("connected to new succ in stabilize");
 
                                 let notify_resp = succ_client
                                     .notify(Request::new(NotifyRequest {
@@ -433,13 +453,14 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
+                                info!("got notify resp in stabilize");
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut data_write = data.write().await;
                                         let mut to_append = BTreeMap::<Vec<u8>, String>::from_iter(
                                             keys.into_iter().zip(vals.into_iter()),
                                         );
+                                        let mut data_write = data.write().await;
                                         data_write.append(&mut to_append);
                                     }
                                     None => {}
@@ -451,6 +472,8 @@ impl Node {
                                 });
                             }
                             false => {
+                                info!("pred not in range");
+                                info!("calling notify on {}", succ_write.as_ref().unwrap().addr);
                                 let succ_client = &mut succ_write.as_mut().unwrap().client;
                                 let notify_resp = succ_client
                                     .notify(Request::new(NotifyRequest {
@@ -459,13 +482,14 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
+                                info!("got notify resp in stabilize");
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut data_write = data.write().await;
                                         let mut to_append = BTreeMap::<Vec<u8>, String>::from_iter(
                                             keys.into_iter().zip(vals.into_iter()),
                                         );
+                                        let mut data_write = data.write().await;
                                         data_write.append(&mut to_append);
                                     }
                                     None => {}
@@ -474,6 +498,7 @@ impl Node {
                         }
                     }
                 }
+                info!("finished stabilizing");
             }
         })
     }
@@ -544,13 +569,20 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("started node");
     let args = env::args().collect_vec();
 
-    let addr_string = args.get(1).unwrap().to_owned();
-    let listener = TcpListener::bind(addr_string.clone()).await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let addr_string = addr.to_string();
+    println!("{}", addr_string);
 
-    let succ = match args.get(2) {
+    let log_file = File::create(format!("{}_log.txt", addr_string)).unwrap();
+    tracing_subscriber::fmt()
+        .with_writer(log_file)
+        .compact()
+        .init();
+
+    let succ = match args.get(1) {
         Some(join_addr) => {
             let join_resp_data = {
                 let mut join_client =
@@ -577,7 +609,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    println!("{}", addr_string);
     let node = Node::new(
         addr_string,
         succ.clone(),

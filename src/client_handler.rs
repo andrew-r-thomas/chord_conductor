@@ -1,12 +1,7 @@
 use std::{process::Stdio, time::Duration};
 
 use rand::seq::SliceRandom;
-use tokio::{
-    io::AsyncReadExt,
-    net::TcpListener,
-    process::Command,
-    time::{interval, sleep},
-};
+use tokio::{io::AsyncReadExt, process::Command, time::interval};
 use tonic::{transport::Channel, Request};
 
 use crate::{
@@ -22,49 +17,49 @@ pub struct ClientHandler {
 
 impl ClientHandler {
     pub async fn spawn(join_addr: Option<String>, data: Vec<Haiku>) -> Self {
-        let addr = {
-            let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-            listener.local_addr().unwrap()
-        };
-
-        let mut _node = match join_addr {
+        let mut node = match join_addr {
             Some(ja) => Command::new("./target/debug/node")
-                .args(&[addr.to_string(), ja])
+                .args(&[ja])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("failed to start node"),
             None => Command::new("./target/debug/node")
-                .args(&[addr.to_string()])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("failed to start node"),
         };
-        sleep(Duration::from_millis(2000)).await;
+
+        let mut stdout = node.stdout.take().unwrap();
+        let mut bytes = [0; 13];
+        stdout.read(&mut bytes).await.unwrap();
+        let addr = String::from_utf8(bytes.to_vec()).unwrap();
 
         let client = NodeServiceClient::connect(format!("http://{}", addr.clone()))
             .await
             .unwrap();
 
         let mut task_client = client.clone();
+        let task_addr = addr.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(1000));
+            let mut interval = interval(Duration::from_millis(10));
             loop {
                 interval.tick().await;
-                let haiku = { data.choose(&mut rand::thread_rng()).unwrap() };
-                let thing = task_client
-                    .set(Request::new(crate::node::SetRequest {
-                        val: haiku.val.clone(),
-                        setter: Some(Setter::Key(haiku.key.clone())),
-                    }))
-                    .await;
+                if rand::random() {
+                    let haiku = { data.choose(&mut rand::thread_rng()).unwrap() };
+                    println!("trying to set on: {}", task_addr);
+                    let thing = task_client
+                        .set(Request::new(crate::node::SetRequest {
+                            val: haiku.val.clone(),
+                            setter: Some(Setter::Key(haiku.key.clone())),
+                        }))
+                        .await;
+                    println!("got data on: {}, data: {:?}", task_addr, thing);
+                }
             }
         });
 
-        Self {
-            addr: addr.to_string(),
-            client,
-        }
+        Self { addr, client }
     }
 }

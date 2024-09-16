@@ -118,6 +118,7 @@ async fn handle_socket(mut socket: WebSocket) {
                         .await;
                         prev_addr = Some(node.addr.clone());
                         clients.push(node);
+                        sleep(Duration::from_millis(139)).await;
                     }
                     poll_send.send(clients).unwrap();
                 }
@@ -138,20 +139,22 @@ async fn handle_socket(mut socket: WebSocket) {
         loop {
             interval.tick().await;
             nodes.clear();
-            let mut records = 0;
+            let mut len = 0;
             for c in clients.iter_mut() {
+                println!("trying to get data for: {}", c.addr);
                 let get_state_resp = c
                     .client
                     .get_state(Request::new(GetStateRequest {}))
                     .await
                     .unwrap();
+                println!("got data for: {}", c.addr);
                 let get_state_data = get_state_resp.into_inner();
-                records += get_state_data.data_len;
                 nodes.push(NodeState {
                     addr: c.addr.clone(),
                     succ: get_state_data.succ,
                     hash: get_state_data.hash,
                 });
+                len += get_state_data.len;
             }
             nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
             ws_send
@@ -159,7 +162,7 @@ async fn handle_socket(mut socket: WebSocket) {
                     serde_json::to_string(&Nodes {
                         kind: "node data".into(),
                         data: nodes.clone(),
-                        len: records,
+                        len,
                     })
                     .unwrap(),
                 ))
