@@ -66,12 +66,12 @@ message NotifyResponse {
 
 message GetStateRequest {}
 message GetStateResponse {
-	string succ = 2;
-	uint32 len = 4;
+	uint32 len = 1;
+	repeated string fingers = 2;
 }
 
 message FindSuccRequest {
-	bytes hash = 2;
+	bytes hash = 1;
 }
 message FindSuccResponse {
 	string addr = 1;

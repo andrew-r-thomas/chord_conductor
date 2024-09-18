@@ -18,7 +18,7 @@ use tokio::{
     fs::File,
     net::TcpListener,
     sync::{mpsc, oneshot},
-    time::{interval, sleep, Duration},
+    time::{interval, Duration},
 };
 use tonic::Request;
 
@@ -64,7 +64,7 @@ pub enum WsSendMessage {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NodeState {
     addr: String,
-    succ: String,
+    fingers: Vec<String>,
     len: u32,
 }
 #[derive(Serialize, Deserialize, Debug)]
@@ -138,7 +138,7 @@ async fn handle_socket(mut socket: WebSocket) {
                 let get_state_data = get_state_resp.into_inner();
                 nodes.push(NodeState {
                     addr: c.addr.clone(),
-                    succ: get_state_data.succ,
+                    fingers: get_state_data.fingers,
                     len: get_state_data.len,
                 });
             }

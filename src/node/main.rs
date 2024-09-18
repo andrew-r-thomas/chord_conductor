@@ -1,3 +1,4 @@
+use core::panic;
 use std::{collections::BTreeMap, env, fs::File, sync::Arc};
 
 use ethnum::U256;
@@ -13,6 +14,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{info, instrument};
 
+pub mod predecessor;
 pub mod successor;
 mod node_service {
     tonic::include_proto!("node");
@@ -28,6 +30,7 @@ use node_service::{
     GetStateResponse, JoinRequest, JoinResponse, NotifyRequest, NotifyResponse, PredRequest,
     PredResponse, SetRequest, SetResponse,
 };
+use predecessor::Predecessor;
 use successor::Successor;
 
 #[derive(Debug)]
@@ -35,30 +38,33 @@ pub struct Node {
     addr: String,
     id: U256,
     data: Arc<RwLock<BTreeMap<U256, String>>>,
-    pred: Arc<RwLock<Option<PredHandle>>>,
+    pred: Arc<Predecessor>,
     finger_table: Arc<Vec<Successor>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PredHandle {
-    addr: String,
-    hash: U256,
-}
-
-// TODO: this pattern matching is gonna be real slow, might not be avoidable
-// but if it is we should try to
 #[tonic::async_trait]
 impl NodeService for Node {
     async fn find_succ(
         &self,
         request: Request<FindSuccRequest>,
     ) -> Result<Response<FindSuccResponse>, Status> {
-        todo!()
+        let request_data = request.into_inner();
+
+        let succ = Self::find_succ(
+            self.addr.clone(),
+            self.id.clone(),
+            &self.finger_table,
+            &U256::from_be_bytes(request_data.hash.try_into().unwrap()),
+        )
+        .await;
+
+        Ok(Response::new(FindSuccResponse {
+            addr: succ.0,
+            hash: succ.1.to_be_bytes().to_vec(),
+        }))
     }
 
-    #[instrument(skip(self))]
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
-        info!("called set");
         let request_message = request.into_inner();
         let hash = match request_message.setter {
             Some(Setter::Key(key)) => {
@@ -71,69 +77,55 @@ impl NodeService for Node {
             None => panic!(),
         };
 
-        info!("waiting for locks in set");
-        let pred_read = { self.pred.read().await.clone() };
-        info!("got pred read in set");
-        let mut succ_write = { self.succ.write().await.clone() };
-        info!("got succ write in set");
+        let pred = { self.pred.recv.borrow().clone() };
 
-        let resp = match succ_write.is_none() {
-            true => {
-                info!("set succ is none");
+        match pred {
+            None => {
                 let mut data_write = self.data.write().await;
                 data_write.insert(hash, request_message.val);
                 Ok(Response::new(SetResponse {
                     loc: self.addr.clone(),
                 }))
             }
-            false => {
-                info!("set succ is some");
-                match pred_read.is_none() {
-                    true => {
-                        info!("pred read is none in set");
-                        let mut data_write = self.data.write().await;
-                        data_write.insert(hash, request_message.val);
-                        Ok(Response::new(SetResponse {
-                            loc: self.addr.clone(),
-                        }))
+            Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
+                true => {
+                    let mut data_write = self.data.write().await;
+                    data_write.insert(hash, request_message.val);
+                    Ok(Response::new(SetResponse {
+                        loc: self.addr.clone(),
+                    }))
+                }
+                false => {
+                    let mut out = None;
+                    for s in self.finger_table.iter().rev() {
+                        if let Some(ss) = { s.recv.borrow().clone() } {
+                            out = Some(ss.client);
+                        }
                     }
-                    false => {
-                        info!("pred read is some in set");
-                        match Self::within_range(&hash, &pred_read.as_ref().unwrap().hash, &self.id)
-                        {
-                            true => {
-                                info!("pred within range");
-                                let mut data_write = self.data.write().await;
-                                data_write.insert(hash, request_message.val);
-                                Ok(Response::new(SetResponse {
-                                    loc: self.addr.clone(),
-                                }))
-                            }
-                            false => {
-                                info!("pred not in range");
-                                succ_write
-                                    .as_mut()
-                                    .unwrap()
-                                    .client
-                                    .set(Request::new(SetRequest {
-                                        val: request_message.val,
-                                        setter: Some(Setter::Hash(hash.to_be_bytes().to_vec())),
-                                    }))
-                                    .await
-                            }
+
+                    match out {
+                        Some(mut c) => {
+                            c.set(Request::new(SetRequest {
+                                val: request_message.val,
+                                setter: Some(Setter::Hash(hash.to_be_bytes().to_vec())),
+                            }))
+                            .await
+                        }
+                        None => {
+                            let mut data_write = self.data.write().await;
+                            data_write.insert(hash, request_message.val);
+                            Ok(Response::new(SetResponse {
+                                loc: self.addr.clone(),
+                            }))
                         }
                     }
                 }
-            }
-        };
-        info!("returning set");
-        resp
+            },
+        }
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let request_message = request.into_inner();
-        let pred_read = { self.pred.read().await.clone() };
-        let mut succ_write = { self.succ.read().await.clone() };
 
         let hash = match request_message.getter {
             Some(Getter::Key(key)) => {
@@ -145,9 +137,11 @@ impl NodeService for Node {
             None => panic!(),
         };
 
-        match succ_write.is_none() {
-            true => {
-                let data_write = self.data.write().await;
+        let pred = { self.pred.recv.borrow().clone() };
+
+        match pred {
+            None => {
+                let data_write = self.data.read().await;
                 let result = match data_write.get(&hash) {
                     Some(v) => Some(get_response::Result::Val(v.into())),
                     None => None,
@@ -157,9 +151,9 @@ impl NodeService for Node {
                     loc: self.addr.clone(),
                 }))
             }
-            false => match pred_read.is_none() {
+            Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
                 true => {
-                    let data_write = self.data.write().await;
+                    let data_write = self.data.read().await;
                     let result = match data_write.get(&hash) {
                         Some(v) => Some(get_response::Result::Val(v.into())),
                         None => None,
@@ -170,9 +164,22 @@ impl NodeService for Node {
                     }))
                 }
                 false => {
-                    match Self::within_range(&hash, &pred_read.as_ref().unwrap().hash, &self.id) {
-                        true => {
-                            let data_write = self.data.write().await;
+                    let mut out = None;
+                    for s in self.finger_table.iter().rev() {
+                        if let Some(ss) = { s.recv.borrow().clone() } {
+                            out = Some(ss.client);
+                        }
+                    }
+
+                    match out {
+                        Some(mut c) => {
+                            c.get(Request::new(GetRequest {
+                                getter: Some(Getter::Hash(hash.to_be_bytes().to_vec())),
+                            }))
+                            .await
+                        }
+                        None => {
+                            let data_write = self.data.read().await;
                             let result = match data_write.get(&hash) {
                                 Some(v) => Some(get_response::Result::Val(v.into())),
                                 None => None,
@@ -181,16 +188,6 @@ impl NodeService for Node {
                                 result,
                                 loc: self.addr.clone(),
                             }))
-                        }
-                        false => {
-                            succ_write
-                                .as_mut()
-                                .unwrap()
-                                .client
-                                .get(Request::new(GetRequest {
-                                    getter: Some(Getter::Hash(hash.to_be_bytes().to_vec())),
-                                }))
-                                .await
                         }
                     }
                 }
@@ -205,76 +202,69 @@ impl NodeService for Node {
         hasher.update(request_message.ip.as_bytes());
         let hash = U256::from_be_bytes(hasher.finalize().into());
 
-        let pred_read = { self.pred.read().await.clone() };
-        let mut succ_write = { self.succ.write().await.clone() };
+        let pred = { self.pred.recv.borrow().clone() };
+        let succ = { self.finger_table.get(0).unwrap().recv.borrow().clone() };
 
-        match succ_write.is_none() {
-            true => Ok(Response::new(JoinResponse {
-                succ_ip: self.addr.clone(),
-                succ_id: self.id.clone().to_be_bytes().to_vec(),
-            })),
-            false => match pred_read.is_none() {
-                true => Ok(Response::new(JoinResponse {
+        match succ {
+            Some(mut s) => match pred {
+                None => Ok(Response::new(JoinResponse {
                     succ_ip: self.addr.clone(),
                     succ_id: self.id.clone().to_be_bytes().to_vec(),
                 })),
-                false => {
-                    match Self::within_range(&hash, &pred_read.as_ref().unwrap().hash, &self.id) {
-                        true => Ok(Response::new(JoinResponse {
-                            succ_ip: self.addr.clone(),
-                            succ_id: self.id.clone().to_be_bytes().to_vec(),
-                        })),
-                        false => {
-                            succ_write
-                                .as_mut()
-                                .unwrap()
-                                .client
-                                .join(Request::new(request_message))
-                                .await
-                        }
-                    }
-                }
+                Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
+                    true => Ok(Response::new(JoinResponse {
+                        succ_ip: self.addr.clone(),
+                        succ_id: self.id.clone().to_be_bytes().to_vec(),
+                    })),
+                    false => s.client.join(Request::new(request_message)).await,
+                },
             },
+            None => Ok(Response::new(JoinResponse {
+                succ_ip: self.addr.clone(),
+                succ_id: self.id.clone().to_be_bytes().to_vec(),
+            })),
         }
     }
 
     async fn pred(&self, _request: Request<PredRequest>) -> Result<Response<PredResponse>, Status> {
-        let pred_read = self.pred.read().await;
+        let pred = { self.pred.recv.borrow().clone() };
 
-        match pred_read.is_none() {
-            true => Ok(Response::new(PredResponse {
+        match pred {
+            None => Ok(Response::new(PredResponse {
                 addr: self.addr.clone(),
                 hash: self.id.clone().to_be_bytes().to_vec(),
             })),
-            false => {
-                let pred = pred_read.as_ref().unwrap();
-                Ok(Response::new(PredResponse {
-                    addr: pred.addr.clone(),
-                    hash: pred.hash.clone().to_be_bytes().to_vec(),
-                }))
-            }
+            Some(p) => Ok(Response::new(PredResponse {
+                addr: p.addr,
+                hash: p.hash.to_be_bytes().to_vec(),
+            })),
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, request))]
     async fn notify(
         &self,
         request: Request<NotifyRequest>,
     ) -> Result<Response<NotifyResponse>, Status> {
-        info!("notify called");
         let request_message = request.into_inner();
-        let mut pred_write = self.pred.write().await;
-        info!("got pred write in notify");
+        let pred = { self.pred.recv.borrow().clone() };
 
         let hash = U256::from_be_bytes(request_message.hash.try_into().unwrap());
-        match pred_write.is_none() {
-            true => {
+
+        match pred {
+            None => {
+                info!("notify pred is none");
                 let mut data_write = self.data.write().await;
                 let to_send = Self::shed_data(&mut data_write, &hash, &self.id, true);
-                *pred_write = Some(PredHandle {
-                    addr: request_message.addr,
-                    hash,
-                });
+
+                self.pred
+                    .send
+                    .send(predecessor::PredecessorData {
+                        addr: request_message.addr,
+                        hash,
+                    })
+                    .unwrap();
+
                 Ok(Response::new(NotifyResponse {
                     has_data: Some(HasData::Data(Data {
                         keys: to_send.0,
@@ -282,25 +272,29 @@ impl NodeService for Node {
                     })),
                 }))
             }
-            false => {
-                match Self::within_range(&hash, &pred_write.as_ref().unwrap().hash, &self.id) {
-                    true => {
-                        let mut data_write = self.data.write().await;
-                        let to_send = Self::shed_data(&mut data_write, &hash, &self.id, true);
-                        *pred_write = Some(PredHandle {
+            Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
+                true => {
+                    info!("notify pred is within range");
+                    let mut data_write = self.data.write().await;
+                    let to_send = Self::shed_data(&mut data_write, &hash, &self.id, true);
+
+                    self.pred
+                        .send
+                        .send(predecessor::PredecessorData {
                             addr: request_message.addr,
                             hash,
-                        });
-                        Ok(Response::new(NotifyResponse {
-                            has_data: Some(HasData::Data(Data {
-                                keys: to_send.0,
-                                vals: to_send.1,
-                            })),
-                        }))
-                    }
-                    false => Ok(Response::new(NotifyResponse { has_data: None })),
+                        })
+                        .unwrap();
+
+                    Ok(Response::new(NotifyResponse {
+                        has_data: Some(HasData::Data(Data {
+                            keys: to_send.0,
+                            vals: to_send.1,
+                        })),
+                    }))
                 }
-            }
+                false => Ok(Response::new(NotifyResponse { has_data: None })),
+            },
         }
     }
 
@@ -309,22 +303,20 @@ impl NodeService for Node {
         &self,
         _request: Request<GetStateRequest>,
     ) -> Result<Response<GetStateResponse>, Status> {
-        info!("called get state");
-        let succ_read = { self.succ.read().await.clone() };
         let len = { self.data.read().await.len() };
 
-        // TODO: maybe just return None for empty vals
-        let succ = {
-            if succ_read.is_none() {
-                "".to_string()
-            } else {
-                succ_read.as_ref().unwrap().addr.clone()
+        let mut fingers = vec![];
+        for finger in self.finger_table.iter() {
+            if let Some(f) = { finger.recv.borrow().clone() } {
+                if !fingers.contains(&f.addr) {
+                    fingers.push(f.addr);
+                }
             }
-        };
+        }
 
         Ok(Response::new(GetStateResponse {
-            succ,
             len: len as u32,
+            fingers,
         }))
     }
 }
@@ -333,6 +325,7 @@ impl Node {
     pub fn new(
         addr: String,
         finger_table: Arc<Vec<Successor>>,
+        pred: Arc<Predecessor>,
         data: Arc<RwLock<BTreeMap<U256, String>>>,
     ) -> Self {
         let mut hasher = Sha256::new();
@@ -340,7 +333,7 @@ impl Node {
         let id = U256::from_be_bytes(hasher.finalize().into());
 
         Self {
-            pred: Arc::new(RwLock::new(None)),
+            pred,
             id,
             addr,
             data,
@@ -366,18 +359,20 @@ impl Node {
             let mut interval = interval(stabilize_interval);
             loop {
                 interval.tick().await;
-                let pred_read = { stabilize_task_pred.read().await.clone() };
+                let pred_read = { stabilize_task_pred.recv.borrow().clone() };
 
                 let successor = stabilize_finger_table.get(0).unwrap();
                 let succ_write = { successor.recv.borrow().clone() };
 
                 match succ_write {
                     Some(mut s) => {
+                        info!("stabilize succ is some");
                         let pred_resp = s.client.pred(Request::new(PredRequest {})).await.unwrap();
                         let pred_data = pred_resp.into_inner();
                         let hash = U256::from_be_bytes(pred_data.hash.try_into().unwrap());
                         match Self::within_range(&hash, &stabilize_task_id, &s.hash) {
                             true => {
+                                info!("stabilize succ pred in range");
                                 let mut succ_client = NodeServiceClient::connect(format!(
                                     "http://{}",
                                     pred_data.addr
@@ -392,6 +387,7 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
+                                info!("stabilize notified succ pred");
                                 let notify_data = notify_resp.into_inner();
 
                                 match notify_data.has_data {
@@ -415,8 +411,10 @@ impl Node {
                                         client: succ_client,
                                     })
                                     .unwrap();
+                                info!("stabilize send new pred");
                             }
                             false => {
+                                info!("stabilize succ pred not in range");
                                 let notify_resp = s
                                     .client
                                     .notify(Request::new(NotifyRequest {
@@ -425,6 +423,7 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
+                                info!("stabilize notified succ");
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
@@ -441,12 +440,10 @@ impl Node {
                             }
                         }
                     }
-                    None => match pred_read.is_none() {
-                        true => {}
-                        false => {
-                            let pred_handle = pred_read.as_ref().unwrap();
+                    None => {
+                        if let Some(p) = pred_read {
                             let mut pred_client =
-                                NodeServiceClient::connect(format!("http://{}", pred_handle.addr))
+                                NodeServiceClient::connect(format!("http://{}", p.addr))
                                     .await
                                     .unwrap();
 
@@ -474,13 +471,13 @@ impl Node {
                             successor
                                 .send
                                 .send(successor::SuccessorData {
-                                    addr: pred_handle.addr.clone(),
-                                    hash: pred_handle.hash.clone(),
+                                    addr: p.addr,
+                                    hash: p.hash,
                                     client: pred_client,
                                 })
                                 .unwrap()
                         }
-                    },
+                    }
                 }
             }
         });
@@ -700,9 +697,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         succs.push(Successor::spawn(None, &mut task_join_set));
     }
 
+    let pred = Predecessor::spawn(&mut task_join_set);
+
     let node = Node::new(
         addr_string,
         Arc::new(succs),
+        Arc::new(pred),
         Arc::new(RwLock::new(BTreeMap::<U256, String>::new())),
     );
 
