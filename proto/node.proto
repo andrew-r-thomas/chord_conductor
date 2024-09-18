@@ -8,6 +8,7 @@ service NodeService {
 	rpc Pred (PredRequest) returns (PredResponse);
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
 	rpc GetState (GetStateRequest) returns (GetStateResponse);
+	rpc FindSucc (FindSuccRequest) returns (FindSuccResponse);
 }
 
 message SetRequest {
@@ -36,7 +37,9 @@ message GetRequest {
 	}
 }
 message GetResponse {
-	string val = 1;
+	oneof result {
+		string val = 1;
+	}
 	string loc = 2;
 }
 
@@ -63,8 +66,14 @@ message NotifyResponse {
 
 message GetStateRequest {}
 message GetStateResponse {
-	bytes hash = 1;
 	string succ = 2;
-	string pred = 3;
 	uint32 len = 4;
+}
+
+message FindSuccRequest {
+	bytes hash = 2;
+}
+message FindSuccResponse {
+	string addr = 1;
+	bytes hash = 2;
 }

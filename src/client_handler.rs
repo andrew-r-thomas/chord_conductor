@@ -1,12 +1,20 @@
-use std::{process::Stdio, time::Duration};
+use std::process::Stdio;
 
 use rand::seq::SliceRandom;
-use tokio::{io::AsyncReadExt, process::Command, time::interval};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    sync::mpsc::Sender,
+    time::{interval, sleep, Duration, Instant},
+};
 use tonic::{transport::Channel, Request};
 
 use crate::{
-    node::{node_service_client::NodeServiceClient, set_request::Setter},
-    Haiku,
+    node::{
+        get_response::Result::Val, node_service_client::NodeServiceClient, set_request::Setter,
+    },
+    Haiku, WsSendMessage,
 };
 
 #[derive(Debug)]
@@ -16,7 +24,11 @@ pub struct ClientHandler {
 }
 
 impl ClientHandler {
-    pub async fn spawn(join_addr: Option<String>, data: Vec<Haiku>) -> Self {
+    pub async fn spawn(
+        join_addr: Option<String>,
+        data: Vec<Haiku>,
+        sender: Sender<WsSendMessage>,
+    ) -> (Vec<u8>, Self) {
         let mut node = match join_addr {
             Some(ja) => Command::new("./target/debug/node")
                 .args(&[ja])
@@ -35,31 +47,58 @@ impl ClientHandler {
         let mut bytes = [0; 13];
         stdout.read(&mut bytes).await.unwrap();
         let addr = String::from_utf8(bytes.to_vec()).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(addr.clone());
+        let hash = hasher.finalize().to_vec();
 
+        sleep(Duration::from_millis(100)).await;
         let client = NodeServiceClient::connect(format!("http://{}", addr.clone()))
             .await
             .unwrap();
 
         let mut task_client = client.clone();
-        let task_addr = addr.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(10));
+            let mut interval = interval(Duration::from_millis(100));
             loop {
                 interval.tick().await;
+                // PERF: could maybe do these concurrently
+                // TODO: also change this to only get values it knows is in there, or something
                 if rand::random() {
                     let haiku = { data.choose(&mut rand::thread_rng()).unwrap() };
-                    println!("trying to set on: {}", task_addr);
-                    let thing = task_client
+                    let get_start = Instant::now();
+                    let get_resp = task_client
+                        .get(Request::new(crate::node::GetRequest {
+                            getter: Some(crate::node::get_request::Getter::Key(haiku.key.clone())),
+                        }))
+                        .await
+                        .unwrap();
+                    let get_latency: Duration = Instant::now() - get_start;
+
+                    let get_data = get_resp.into_inner();
+                    if let Some(val) = get_data.result {
+                        match val {
+                            Val(v) => {
+                                sender
+                                    .send(WsSendMessage::Haiku(v, get_latency.as_millis()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                if rand::random() {
+                    let haiku = { data.choose(&mut rand::thread_rng()).unwrap() };
+                    task_client
                         .set(Request::new(crate::node::SetRequest {
                             val: haiku.val.clone(),
                             setter: Some(Setter::Key(haiku.key.clone())),
                         }))
-                        .await;
-                    println!("got data on: {}, data: {:?}", task_addr, thing);
+                        .await
+                        .unwrap();
                 }
             }
         });
 
-        Self { addr, client }
+        (hash, Self { addr, client })
     }
 }
