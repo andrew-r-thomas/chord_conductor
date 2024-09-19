@@ -1,17 +1,16 @@
-use std::{collections::BTreeMap, env, fs::File, sync::Arc};
+use std::{collections::BTreeMap, env, sync::Arc};
 
 use ethnum::U256;
 use itertools::Itertools;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
-    sync::RwLock,
+    sync::{watch, RwLock},
     task::JoinSet,
     time::{interval, Duration},
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, instrument};
 
 pub mod predecessor;
 pub mod successor;
@@ -37,18 +36,12 @@ ok so what do we want to do here
 
 make things configurable live:
 - number of nodes
-- get/set lean of nodes
-- activity level of nodes
 - failure rate of nodes
 - frequency of periodics
 
 node failure
 node planed leave
 data loss
-
-TODO:
-change hash situation:
-- probably move to sha1
 */
 
 #[derive(Debug)]
@@ -58,6 +51,8 @@ pub struct Node {
     data: Arc<RwLock<BTreeMap<U256, Quote>>>,
     pred: Arc<Predecessor>,
     finger_table: Arc<Vec<Successor>>,
+    stab_freq_send: watch::Sender<u64>,
+    fix_fing_freq_send: watch::Sender<u64>,
 }
 
 #[tonic::async_trait]
@@ -265,7 +260,6 @@ impl NodeService for Node {
         }
     }
 
-    #[instrument(skip(self, request))]
     async fn notify(
         &self,
         request: Request<NotifyRequest>,
@@ -277,7 +271,6 @@ impl NodeService for Node {
 
         match pred {
             None => {
-                info!("notify pred is none");
                 let mut data_write = self.data.write().await;
                 let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
@@ -298,7 +291,6 @@ impl NodeService for Node {
             }
             Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
                 true => {
-                    info!("notify pred is within range");
                     let mut data_write = self.data.write().await;
                     let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
@@ -322,7 +314,6 @@ impl NodeService for Node {
         }
     }
 
-    #[instrument(skip(self))]
     async fn get_state(
         &self,
         _request: Request<GetStateRequest>,
@@ -346,16 +337,20 @@ impl NodeService for Node {
 
     async fn update_stab_freq(
         &self,
-        _request: Request<UpdateStabFreqRequest>,
+        request: Request<UpdateStabFreqRequest>,
     ) -> Result<Response<UpdateStabFreqResponse>, Status> {
-        todo!()
+        let request_data = request.into_inner();
+        self.stab_freq_send.send(request_data.new).unwrap();
+        Ok(Response::new(UpdateStabFreqResponse {}))
     }
 
     async fn update_fix_fing_freq(
         &self,
-        _request: Request<UpdateFixFingFreqRequest>,
+        request: Request<UpdateFixFingFreqRequest>,
     ) -> Result<Response<UpdateFixFingFreqResponse>, Status> {
-        todo!()
+        let request_data = request.into_inner();
+        self.fix_fing_freq_send.send(request_data.new).unwrap();
+        Ok(Response::new(UpdateFixFingFreqResponse {}))
     }
 }
 
@@ -365,6 +360,8 @@ impl Node {
         finger_table: Arc<Vec<Successor>>,
         pred: Arc<Predecessor>,
         data: Arc<RwLock<BTreeMap<U256, Quote>>>,
+        stab_freq_send: watch::Sender<u64>,
+        fix_fing_freq_send: watch::Sender<u64>,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(addr.as_bytes());
@@ -375,15 +372,18 @@ impl Node {
             id,
             addr,
             data,
+            stab_freq_send,
+            fix_fing_freq_send,
             finger_table,
         }
     }
 
-    #[instrument(skip(self))]
     pub fn start_periodics(
         &self,
-        stabilize_interval: Duration,
-        fix_fingers_interval: Duration,
+        stabilize_freq: u64,
+        fix_fingers_freq: u64,
+        stab_freq_recv: watch::Receiver<u64>,
+        fix_fing_freq_recv: watch::Receiver<u64>,
         join_set: &mut JoinSet<()>,
     ) {
         let stabilize_task_id = self.id.clone();
@@ -394,9 +394,15 @@ impl Node {
 
         join_set.spawn(async move {
             // stabilize
-            let mut interval = interval(stabilize_interval);
+            let mut ticker = interval(Duration::from_millis(stabilize_freq));
+            let mut stab_freq = stabilize_freq;
             loop {
-                interval.tick().await;
+                ticker.tick().await;
+                let current_stab_freq = { *stab_freq_recv.borrow() };
+                if current_stab_freq != stab_freq {
+                    ticker = interval(Duration::from_millis(current_stab_freq));
+                    stab_freq = current_stab_freq;
+                }
                 let pred_read = { stabilize_task_pred.recv.borrow().clone() };
 
                 let successor = stabilize_finger_table.get(0).unwrap();
@@ -404,13 +410,11 @@ impl Node {
 
                 match succ_write {
                     Some(mut s) => {
-                        info!("stabilize succ is some");
                         let pred_resp = s.client.pred(Request::new(PredRequest {})).await.unwrap();
                         let pred_data = pred_resp.into_inner();
                         let hash = U256::from_be_bytes(pred_data.hash.try_into().unwrap());
                         match Self::within_range(&hash, &stabilize_task_id, &s.hash) {
                             true => {
-                                info!("stabilize succ pred in range");
                                 let mut succ_client = NodeServiceClient::connect(format!(
                                     "http://{}",
                                     pred_data.addr
@@ -425,7 +429,6 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
-                                info!("stabilize notified succ pred");
                                 let notify_data = notify_resp.into_inner();
 
                                 match notify_data.has_data {
@@ -449,10 +452,8 @@ impl Node {
                                         client: succ_client,
                                     })
                                     .unwrap();
-                                info!("stabilize send new pred");
                             }
                             false => {
-                                info!("stabilize succ pred not in range");
                                 let notify_resp = s
                                     .client
                                     .notify(Request::new(NotifyRequest {
@@ -461,7 +462,6 @@ impl Node {
                                     }))
                                     .await
                                     .unwrap();
-                                info!("stabilize notified succ");
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
@@ -526,10 +526,15 @@ impl Node {
         join_set.spawn(async move {
             // fix fingers
             let mut next: u32 = 1;
-            let mut interval = interval(fix_fingers_interval);
-            interval.tick().await;
+            let mut ticker = interval(Duration::from_millis(fix_fingers_freq));
+            let mut fix_fing_freq = fix_fingers_freq;
             loop {
-                interval.tick().await;
+                ticker.tick().await;
+                let current_fix_fing_freq = { *fix_fing_freq_recv.borrow() };
+                if current_fix_fing_freq != fix_fing_freq {
+                    ticker = interval(Duration::from_millis(current_fix_fing_freq));
+                    fix_fing_freq = current_fix_fing_freq;
+                }
                 next += 1;
                 if next > 255 {
                     next = 1;
@@ -540,27 +545,31 @@ impl Node {
                     fix_fingers_addr.clone(),
                     fix_fingers_hash.clone(),
                     &fix_fingers_task_finger_table,
-                    &(fix_fingers_hash + U256::new(2).pow(next)),
+                    &(fix_fingers_hash.wrapping_add(U256::new(2).wrapping_pow(next))),
                 )
                 .await;
 
+                if succesor.0 == fix_fingers_addr {
+                    continue;
+                }
                 if let Some(s) = { finger.recv.borrow().clone() } {
                     if s.addr == succesor.0 {
                         continue;
                     }
                 }
-                let client = NodeServiceClient::connect(format!("http://{}", succesor.0))
-                    .await
-                    .unwrap();
 
-                finger
-                    .send
-                    .send(successor::SuccessorData {
-                        addr: succesor.0,
-                        hash: succesor.1,
-                        client,
-                    })
-                    .unwrap();
+                if let Ok(client) =
+                    NodeServiceClient::connect(format!("http://{}", succesor.0)).await
+                {
+                    finger
+                        .send
+                        .send(successor::SuccessorData {
+                            addr: succesor.0,
+                            hash: succesor.1,
+                            client,
+                        })
+                        .unwrap();
+                }
             }
         });
     }
@@ -661,15 +670,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr_string = addr.to_string();
     println!("{addr_string}");
 
-    let log_file = File::create(format!("logs/{addr_string}_log.txt")).unwrap();
-    tracing_subscriber::fmt()
-        .with_writer(log_file)
-        .compact()
-        .init();
-
     let mut task_join_set = JoinSet::new();
-    let stab_freq: u32 = args.get(1).unwrap().parse().unwrap();
-    let fix_fing_freq: u32 = args.get(2).unwrap().parse().unwrap();
+
+    let stab_freq: u64 = args.get(1).unwrap().parse().unwrap();
+    let fix_fing_freq: u64 = args.get(2).unwrap().parse().unwrap();
+    let (stab_freq_send, stab_freq_recv) = watch::channel(stab_freq);
+    let (fix_fing_freq_send, fix_fing_freq_recv) = watch::channel(fix_fing_freq);
+
     let first_succ = match args.get(3) {
         Some(join_addr) => {
             let join_resp_data = {
@@ -712,12 +719,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(succs),
         Arc::new(pred),
         Arc::new(RwLock::new(BTreeMap::<U256, Quote>::new())),
+        stab_freq_send,
+        fix_fing_freq_send,
     );
 
-    // TODO: maybe make inputs u64
     node.start_periodics(
-        Duration::from_millis(stab_freq.into()),
-        Duration::from_millis(fix_fing_freq.into()),
+        stab_freq,
+        fix_fing_freq,
+        stab_freq_recv,
+        fix_fing_freq_recv,
         &mut task_join_set,
     );
 
