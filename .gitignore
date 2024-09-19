@@ -1,3 +1,4 @@
 target/
 logs/
 quotes.csv
+.DS_Store
