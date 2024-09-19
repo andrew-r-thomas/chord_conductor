@@ -1,2 +1,5 @@
-/target
-/logs
+version https://git-lfs.github.com/spec/v1
+oid sha256:847f9339ec769e53233f1843ac0d83224d5854fefc229f19bc1bde425ca3da30
+size 14
+target/
+logs/
