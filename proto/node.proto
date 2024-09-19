@@ -4,22 +4,31 @@ package node;
 service NodeService {
 	rpc Set (SetRequest) returns (SetResponse);
 	rpc Get (GetRequest) returns (GetResponse);
+
 	rpc Join (JoinRequest) returns (JoinResponse);
+	rpc FindSucc (FindSuccRequest) returns (FindSuccResponse);
+
 	rpc Pred (PredRequest) returns (PredResponse);
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
+
 	rpc GetState (GetStateRequest) returns (GetStateResponse);
-	rpc FindSucc (FindSuccRequest) returns (FindSuccResponse);
+	rpc UpdateStabFreq (UpdateStabFreqRequest) returns (UpdateStabFreqResponse);
+	rpc UpdateFixFingFreq (UpdateFixFingFreqRequest) returns (UpdateFixFingFreqResponse);
 }
 
+message Quote {
+	string quote = 1;
+	string author = 2;
+}
 message SetRequest {
+	Quote val = 1;
 	oneof setter {
-		string key = 1;
-		bytes hash = 2;
+		bytes key = 2;
 	}
-	string val = 3;
 }
 message SetResponse {
-	string loc = 1;
+	bytes hash = 1;
+	uint32 path_len = 2;
 }
 
 message JoinRequest {
@@ -31,16 +40,13 @@ message JoinResponse {
 }
 
 message GetRequest {
-	oneof getter {
-		string key = 1;
-		bytes hash = 2;
-	}
+	bytes key = 1;
 }
 message GetResponse {
 	oneof result {
-		string val = 1;
+		Quote val = 1;
 	}
-	string loc = 2;
+	uint32 path_len = 2;
 }
 
 message PredRequest {}
@@ -51,7 +57,7 @@ message PredResponse {
 
 message Data {
 	repeated bytes keys = 1;
-	repeated string vals = 2;
+	repeated Quote vals = 2;
 }
 
 message NotifyRequest {
@@ -77,3 +83,13 @@ message FindSuccResponse {
 	string addr = 1;
 	bytes hash = 2;
 }
+
+message UpdateStabFreqRequest {
+	uint32 new = 1;
+}
+message UpdateStabFreqResponse {}
+
+message UpdateFixFingFreqRequest {
+	uint32 new = 1;
+}
+message UpdateFixFingFreqResponse {}

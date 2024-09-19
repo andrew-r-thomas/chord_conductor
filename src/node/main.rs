@@ -1,4 +1,3 @@
-use core::panic;
 use std::{collections::BTreeMap, env, fs::File, sync::Arc};
 
 use ethnum::U256;
@@ -20,7 +19,6 @@ mod node_service {
     tonic::include_proto!("node");
 }
 use node_service::{
-    get_request::Getter,
     get_response,
     node_service_client::NodeServiceClient,
     node_service_server::{NodeService, NodeServiceServer},
@@ -28,16 +26,36 @@ use node_service::{
     set_request::Setter,
     Data, FindSuccRequest, FindSuccResponse, GetRequest, GetResponse, GetStateRequest,
     GetStateResponse, JoinRequest, JoinResponse, NotifyRequest, NotifyResponse, PredRequest,
-    PredResponse, SetRequest, SetResponse,
+    PredResponse, Quote, SetRequest, SetResponse, UpdateFixFingFreqRequest,
+    UpdateFixFingFreqResponse, UpdateStabFreqRequest, UpdateStabFreqResponse,
 };
 use predecessor::Predecessor;
 use successor::Successor;
+
+/*
+ok so what do we want to do here
+
+make things configurable live:
+- number of nodes
+- get/set lean of nodes
+- activity level of nodes
+- failure rate of nodes
+- frequency of periodics
+
+node failure
+node planed leave
+data loss
+
+TODO:
+change hash situation:
+- probably move to sha1
+*/
 
 #[derive(Debug)]
 pub struct Node {
     addr: String,
     id: U256,
-    data: Arc<RwLock<BTreeMap<U256, String>>>,
+    data: Arc<RwLock<BTreeMap<U256, Quote>>>,
     pred: Arc<Predecessor>,
     finger_table: Arc<Vec<Successor>>,
 }
@@ -67,14 +85,12 @@ impl NodeService for Node {
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
         let request_message = request.into_inner();
         let hash = match request_message.setter {
-            Some(Setter::Key(key)) => {
+            Some(Setter::Key(hash)) => U256::from_be_bytes(hash.try_into().unwrap()),
+            None => {
                 let mut hasher = Sha256::new();
-                hasher.update(key);
-                let h = hasher.finalize();
-                U256::from_be_bytes(h.into())
+                hasher.update(request_message.val.clone().unwrap().quote);
+                U256::from_be_bytes(hasher.finalize().into())
             }
-            Some(Setter::Hash(hash)) => U256::from_be_bytes(hash.try_into().unwrap()),
-            None => panic!(),
         };
 
         let pred = { self.pred.recv.borrow().clone() };
@@ -82,17 +98,19 @@ impl NodeService for Node {
         match pred {
             None => {
                 let mut data_write = self.data.write().await;
-                data_write.insert(hash, request_message.val);
+                data_write.insert(hash, request_message.val.unwrap());
                 Ok(Response::new(SetResponse {
-                    loc: self.addr.clone(),
+                    hash: hash.to_be_bytes().into(),
+                    path_len: 0,
                 }))
             }
             Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
                 true => {
                     let mut data_write = self.data.write().await;
-                    data_write.insert(hash, request_message.val);
+                    data_write.insert(hash, request_message.val.unwrap());
                     Ok(Response::new(SetResponse {
-                        loc: self.addr.clone(),
+                        hash: hash.to_be_bytes().into(),
+                        path_len: 0,
                     }))
                 }
                 false => {
@@ -105,17 +123,25 @@ impl NodeService for Node {
 
                     match out {
                         Some(mut c) => {
-                            c.set(Request::new(SetRequest {
-                                val: request_message.val,
-                                setter: Some(Setter::Hash(hash.to_be_bytes().to_vec())),
+                            let resp = c
+                                .set(Request::new(SetRequest {
+                                    val: request_message.val,
+                                    setter: Some(Setter::Key(hash.to_be_bytes().into())),
+                                }))
+                                .await
+                                .unwrap();
+                            let d = resp.into_inner();
+                            Ok(Response::new(SetResponse {
+                                hash: d.hash,
+                                path_len: d.path_len + 1,
                             }))
-                            .await
                         }
                         None => {
                             let mut data_write = self.data.write().await;
-                            data_write.insert(hash, request_message.val);
+                            data_write.insert(hash, request_message.val.unwrap());
                             Ok(Response::new(SetResponse {
-                                loc: self.addr.clone(),
+                                hash: hash.to_be_bytes().into(),
+                                path_len: 0,
                             }))
                         }
                     }
@@ -127,40 +153,31 @@ impl NodeService for Node {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let request_message = request.into_inner();
 
-        let hash = match request_message.getter {
-            Some(Getter::Key(key)) => {
-                let mut hasher = Sha256::new();
-                hasher.update(key);
-                U256::from_be_bytes(hasher.finalize().into())
-            }
-            Some(Getter::Hash(hash)) => U256::from_be_bytes(hash.try_into().unwrap()),
-            None => panic!(),
-        };
-
         let pred = { self.pred.recv.borrow().clone() };
 
+        let hash = U256::from_be_bytes(request_message.key.try_into().unwrap());
         match pred {
             None => {
-                let data_write = self.data.read().await;
-                let result = match data_write.get(&hash) {
-                    Some(v) => Some(get_response::Result::Val(v.into())),
+                let data_read = self.data.read().await;
+                let result = match data_read.get(&hash) {
+                    Some(v) => Some(get_response::Result::Val(v.clone())),
                     None => None,
                 };
                 Ok(Response::new(GetResponse {
                     result,
-                    loc: self.addr.clone(),
+                    path_len: 0,
                 }))
             }
             Some(p) => match Self::within_range(&hash, &p.hash, &self.id) {
                 true => {
                     let data_write = self.data.read().await;
                     let result = match data_write.get(&hash) {
-                        Some(v) => Some(get_response::Result::Val(v.into())),
+                        Some(v) => Some(get_response::Result::Val(v.clone())),
                         None => None,
                     };
                     Ok(Response::new(GetResponse {
                         result,
-                        loc: self.addr.clone(),
+                        path_len: 0,
                     }))
                 }
                 false => {
@@ -173,20 +190,27 @@ impl NodeService for Node {
 
                     match out {
                         Some(mut c) => {
-                            c.get(Request::new(GetRequest {
-                                getter: Some(Getter::Hash(hash.to_be_bytes().to_vec())),
+                            let resp = c
+                                .get(Request::new(GetRequest {
+                                    key: hash.to_be_bytes().to_vec(),
+                                }))
+                                .await
+                                .unwrap();
+                            let d = resp.into_inner();
+                            Ok(Response::new(GetResponse {
+                                path_len: d.path_len + 1,
+                                result: d.result,
                             }))
-                            .await
                         }
                         None => {
                             let data_write = self.data.read().await;
                             let result = match data_write.get(&hash) {
-                                Some(v) => Some(get_response::Result::Val(v.into())),
+                                Some(v) => Some(get_response::Result::Val(v.clone())),
                                 None => None,
                             };
                             Ok(Response::new(GetResponse {
                                 result,
-                                loc: self.addr.clone(),
+                                path_len: 0,
                             }))
                         }
                     }
@@ -255,7 +279,7 @@ impl NodeService for Node {
             None => {
                 info!("notify pred is none");
                 let mut data_write = self.data.write().await;
-                let to_send = Self::shed_data(&mut data_write, &hash, &self.id, true);
+                let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
                 self.pred
                     .send
@@ -276,7 +300,7 @@ impl NodeService for Node {
                 true => {
                     info!("notify pred is within range");
                     let mut data_write = self.data.write().await;
-                    let to_send = Self::shed_data(&mut data_write, &hash, &self.id, true);
+                    let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
                     self.pred
                         .send
@@ -319,6 +343,20 @@ impl NodeService for Node {
             fingers,
         }))
     }
+
+    async fn update_stab_freq(
+        &self,
+        _request: Request<UpdateStabFreqRequest>,
+    ) -> Result<Response<UpdateStabFreqResponse>, Status> {
+        todo!()
+    }
+
+    async fn update_fix_fing_freq(
+        &self,
+        _request: Request<UpdateFixFingFreqRequest>,
+    ) -> Result<Response<UpdateFixFingFreqResponse>, Status> {
+        todo!()
+    }
 }
 
 impl Node {
@@ -326,7 +364,7 @@ impl Node {
         addr: String,
         finger_table: Arc<Vec<Successor>>,
         pred: Arc<Predecessor>,
-        data: Arc<RwLock<BTreeMap<U256, String>>>,
+        data: Arc<RwLock<BTreeMap<U256, Quote>>>,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(addr.as_bytes());
@@ -392,7 +430,7 @@ impl Node {
 
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut to_append = BTreeMap::<U256, String>::from_iter(
+                                        let mut to_append = BTreeMap::<U256, Quote>::from_iter(
                                             keys.into_iter()
                                                 .map(|k| U256::from_be_bytes(k.try_into().unwrap()))
                                                 .zip(vals.into_iter()),
@@ -427,7 +465,7 @@ impl Node {
                                 let notify_data = notify_resp.into_inner();
                                 match notify_data.has_data {
                                     Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut to_append = BTreeMap::<U256, String>::from_iter(
+                                        let mut to_append = BTreeMap::<U256, Quote>::from_iter(
                                             keys.into_iter()
                                                 .map(|k| U256::from_be_bytes(k.try_into().unwrap()))
                                                 .zip(vals.into_iter()),
@@ -458,7 +496,7 @@ impl Node {
 
                             match notify_data.has_data {
                                 Some(HasData::Data(Data { keys, vals })) => {
-                                    let mut to_append = BTreeMap::<U256, String>::from_iter(
+                                    let mut to_append = BTreeMap::<U256, Quote>::from_iter(
                                         keys.into_iter()
                                             .map(|k| U256::from_be_bytes(k.try_into().unwrap()))
                                             .zip(vals.into_iter()),
@@ -487,14 +525,14 @@ impl Node {
         let fix_fingers_addr = self.addr.clone();
         join_set.spawn(async move {
             // fix fingers
-            let mut next: u32 = 0;
+            let mut next: u32 = 1;
             let mut interval = interval(fix_fingers_interval);
             interval.tick().await;
             loop {
                 interval.tick().await;
                 next += 1;
                 if next > 255 {
-                    next = 0;
+                    next = 1;
                 }
 
                 let finger = fix_fingers_task_finger_table.get(next as usize).unwrap();
@@ -574,14 +612,12 @@ impl Node {
     }
 
     pub fn shed_data(
-        data: &mut BTreeMap<U256, String>,
+        data: &mut BTreeMap<U256, Quote>,
         split_start: &U256,
         split_end: &U256,
-        // TODO: might not need this is we're only using the function in notify
-        keep_split: bool,
-    ) -> (Vec<Vec<u8>>, Vec<String>) {
-        match (keep_split, split_start > split_end) {
-            (true, true) => {
+    ) -> (Vec<Vec<u8>>, Vec<Quote>) {
+        match split_start > split_end {
+            true => {
                 let mut first_keep = data.split_off(split_start);
                 let to_send = data.split_off(split_end);
 
@@ -596,42 +632,12 @@ impl Node {
                     to_send.clone().into_values().collect_vec(),
                 )
             }
-            (true, false) => {
+            false => {
                 let mut to_send = data.split_off(split_end);
                 let to_keep = data.split_off(split_start);
 
                 to_send.append(data);
                 *data = to_keep;
-
-                (
-                    to_send
-                        .clone()
-                        .into_keys()
-                        .map(|k| k.to_be_bytes().to_vec())
-                        .collect_vec(),
-                    to_send.clone().into_values().collect_vec(),
-                )
-            }
-            (false, true) => {
-                let mut to_send = data.split_off(split_start);
-                let to_keep = data.split_off(split_end);
-
-                to_send.append(data);
-                *data = to_keep;
-
-                (
-                    to_send
-                        .clone()
-                        .into_keys()
-                        .map(|k| k.to_be_bytes().to_vec())
-                        .collect_vec(),
-                    to_send.clone().into_values().collect_vec(),
-                )
-            }
-            (false, false) => {
-                let mut to_keep = data.split_off(split_end);
-                let to_send = data.split_off(split_start);
-                data.append(&mut to_keep);
 
                 (
                     to_send
@@ -662,7 +668,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let mut task_join_set = JoinSet::new();
-    let first_succ = match args.get(1) {
+    let stab_freq: u32 = args.get(1).unwrap().parse().unwrap();
+    let fix_fing_freq: u32 = args.get(2).unwrap().parse().unwrap();
+    let first_succ = match args.get(3) {
         Some(join_addr) => {
             let join_resp_data = {
                 let mut join_client =
@@ -703,13 +711,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         addr_string,
         Arc::new(succs),
         Arc::new(pred),
-        Arc::new(RwLock::new(BTreeMap::<U256, String>::new())),
+        Arc::new(RwLock::new(BTreeMap::<U256, Quote>::new())),
     );
 
-    // TODO: figure out timing
+    // TODO: maybe make inputs u64
     node.start_periodics(
-        Duration::from_millis(100),
-        Duration::from_millis(100),
+        Duration::from_millis(stab_freq.into()),
+        Duration::from_millis(fix_fing_freq.into()),
         &mut task_join_set,
     );
 
