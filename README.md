@@ -25,6 +25,9 @@ bun run dev
 the client will be on `localhost:4321`
 
 ## Demo
+
+https://github.com/user-attachments/assets/695701f9-a65e-4d7e-9d5f-c3750150d651
+
 ## Implementation Details
 #### chord node
 the "node" in this project is a gRPC server that implements a distributed hash table on top of the chord protocol.
