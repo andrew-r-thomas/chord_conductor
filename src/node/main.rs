@@ -5,15 +5,16 @@ use itertools::Itertools;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
-    sync::RwLock,
+    sync::{watch, RwLock},
     task::JoinSet,
     time::{interval, Duration},
 };
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{
+    transport::{Channel, Server},
+    Request, Response, Status,
+};
 
-pub mod predecessor;
-pub mod successor;
 mod node_service {
     tonic::include_proto!("node");
 }
@@ -27,16 +28,26 @@ use node_service::{
     GetStateResponse, JoinRequest, JoinResponse, NotifyRequest, NotifyResponse, PredRequest,
     PredResponse, Quote, SetRequest, SetResponse,
 };
-use predecessor::Predecessor;
-use successor::Successor;
 
 #[derive(Debug)]
 pub struct Node {
     addr: String,
     id: U256,
     data: Arc<RwLock<BTreeMap<U256, Quote>>>,
-    pred: Arc<Predecessor>,
-    finger_table: Arc<Vec<Successor>>,
+    pred: (watch::Sender<Option<Pred>>, watch::Receiver<Option<Pred>>),
+    finger_table: Vec<(watch::Sender<Option<Succ>>, watch::Receiver<Option<Succ>>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pred {
+    hash: U256,
+    addr: String,
+}
+#[derive(Debug, Clone)]
+pub struct Succ {
+    addr: String,
+    hash: U256,
+    client: NodeServiceClient<Channel>,
 }
 
 #[tonic::async_trait]
@@ -72,7 +83,7 @@ impl NodeService for Node {
             }
         };
 
-        let pred = { self.pred.recv.borrow().clone() };
+        let pred = { self.pred.1.borrow().clone() };
 
         match pred {
             None => {
@@ -95,7 +106,7 @@ impl NodeService for Node {
                 false => {
                     let mut out = None;
                     for s in self.finger_table.iter().rev() {
-                        if let Some(ss) = { s.recv.borrow().clone() } {
+                        if let Some(ss) = { s.1.borrow().clone() } {
                             out = Some(ss.client);
                         }
                     }
@@ -132,7 +143,7 @@ impl NodeService for Node {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let request_message = request.into_inner();
 
-        let pred = { self.pred.recv.borrow().clone() };
+        let pred = { self.pred.1.borrow().clone() };
 
         let hash = U256::from_be_bytes(request_message.key.try_into().unwrap());
         match pred {
@@ -162,7 +173,7 @@ impl NodeService for Node {
                 false => {
                     let mut out = None;
                     for s in self.finger_table.iter().rev() {
-                        if let Some(ss) = { s.recv.borrow().clone() } {
+                        if let Some(ss) = { s.1.borrow().clone() } {
                             out = Some(ss.client);
                         }
                     }
@@ -205,8 +216,8 @@ impl NodeService for Node {
         hasher.update(request_message.ip.as_bytes());
         let hash = U256::from_be_bytes(hasher.finalize().into());
 
-        let pred = { self.pred.recv.borrow().clone() };
-        let succ = { self.finger_table.get(0).unwrap().recv.borrow().clone() };
+        let pred = { self.pred.1.borrow().clone() };
+        let succ = { self.finger_table.get(0).unwrap().1.borrow().clone() };
 
         match succ {
             Some(mut s) => match pred {
@@ -230,7 +241,7 @@ impl NodeService for Node {
     }
 
     async fn pred(&self, _request: Request<PredRequest>) -> Result<Response<PredResponse>, Status> {
-        let pred = { self.pred.recv.borrow().clone() };
+        let pred = { self.pred.1.borrow().clone() };
 
         match pred {
             None => Ok(Response::new(PredResponse {
@@ -249,7 +260,7 @@ impl NodeService for Node {
         request: Request<NotifyRequest>,
     ) -> Result<Response<NotifyResponse>, Status> {
         let request_message = request.into_inner();
-        let pred = { self.pred.recv.borrow().clone() };
+        let pred = { self.pred.1.borrow().clone() };
 
         let hash = U256::from_be_bytes(request_message.hash.try_into().unwrap());
 
@@ -259,8 +270,8 @@ impl NodeService for Node {
                 let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
                 self.pred
-                    .send
-                    .send(Some(predecessor::PredecessorData {
+                    .0
+                    .send(Some(Pred {
                         addr: request_message.addr,
                         hash,
                     }))
@@ -279,8 +290,8 @@ impl NodeService for Node {
                     let to_send = Self::shed_data(&mut data_write, &hash, &self.id);
 
                     self.pred
-                        .send
-                        .send(Some(predecessor::PredecessorData {
+                        .0
+                        .send(Some(Pred {
                             addr: request_message.addr,
                             hash,
                         }))
@@ -306,7 +317,7 @@ impl NodeService for Node {
 
         let mut fingers = vec![];
         for finger in self.finger_table.iter() {
-            if let Some(f) = { finger.recv.borrow().clone() } {
+            if let Some(f) = { finger.0.borrow().clone() } {
                 if !fingers.contains(&f.addr) {
                     fingers.push(f.addr);
                 }
@@ -323,8 +334,8 @@ impl NodeService for Node {
 impl Node {
     pub fn new(
         addr: String,
-        finger_table: Arc<Vec<Successor>>,
-        pred: Arc<Predecessor>,
+        finger_table: Vec<(watch::Sender<Option<Succ>>, watch::Receiver<Option<Succ>>)>,
+        pred: (watch::Sender<Option<Pred>>, watch::Receiver<Option<Pred>>),
         data: Arc<RwLock<BTreeMap<U256, Quote>>>,
     ) -> Self {
         let mut hasher = Sha256::new();
@@ -357,55 +368,55 @@ impl Node {
             let mut ticker = interval(Duration::from_millis(stabilize_freq));
             loop {
                 ticker.tick().await;
-                let pred_read = { stabilize_task_pred.recv.borrow().clone() };
+                let pred_read = { stabilize_task_pred.1.borrow().clone() };
 
                 let successor = stabilize_finger_table.get(0).unwrap();
-                let succ_write = { successor.recv.borrow().clone() };
+                let succ = { successor.1.borrow().clone() };
 
-                match succ_write {
+                match succ {
                     Some(mut s) => {
                         let pred_resp = s.client.pred(Request::new(PredRequest {})).await.unwrap();
                         let pred_data = pred_resp.into_inner();
                         let hash = U256::from_be_bytes(pred_data.hash.try_into().unwrap());
                         match Self::within_range(&hash, &stabilize_task_id, &s.hash) {
                             true => {
-                                let mut succ_client = NodeServiceClient::connect(format!(
-                                    "http://{}",
-                                    pred_data.addr
-                                ))
-                                .await
-                                .unwrap();
+                                if let Ok(mut succ_client) =
+                                    NodeServiceClient::connect(format!("http://{}", pred_data.addr))
+                                        .await
+                                {
+                                    let notify_resp = succ_client
+                                        .notify(Request::new(NotifyRequest {
+                                            addr: stabilize_task_addr.clone(),
+                                            hash: stabilize_task_id.clone().to_be_bytes().to_vec(),
+                                        }))
+                                        .await
+                                        .unwrap();
+                                    let notify_data = notify_resp.into_inner();
 
-                                let notify_resp = succ_client
-                                    .notify(Request::new(NotifyRequest {
-                                        addr: stabilize_task_addr.clone(),
-                                        hash: stabilize_task_id.clone().to_be_bytes().to_vec(),
-                                    }))
-                                    .await
-                                    .unwrap();
-                                let notify_data = notify_resp.into_inner();
-
-                                match notify_data.has_data {
-                                    Some(HasData::Data(Data { keys, vals })) => {
-                                        let mut to_append = BTreeMap::<U256, Quote>::from_iter(
-                                            keys.into_iter()
-                                                .map(|k| U256::from_be_bytes(k.try_into().unwrap()))
-                                                .zip(vals.into_iter()),
-                                        );
-                                        let mut data_write = stabilize_task_data.write().await;
-                                        data_write.append(&mut to_append);
+                                    match notify_data.has_data {
+                                        Some(HasData::Data(Data { keys, vals })) => {
+                                            let mut to_append = BTreeMap::<U256, Quote>::from_iter(
+                                                keys.into_iter()
+                                                    .map(|k| {
+                                                        U256::from_be_bytes(k.try_into().unwrap())
+                                                    })
+                                                    .zip(vals.into_iter()),
+                                            );
+                                            let mut data_write = stabilize_task_data.write().await;
+                                            data_write.append(&mut to_append);
+                                        }
+                                        None => {}
                                     }
-                                    None => {}
-                                }
 
-                                successor
-                                    .send
-                                    .send(successor::SuccessorData {
-                                        addr: pred_data.addr,
-                                        hash,
-                                        client: succ_client,
-                                    })
-                                    .unwrap();
+                                    successor
+                                        .0
+                                        .send(Some(Succ {
+                                            addr: pred_data.addr,
+                                            hash,
+                                            client: succ_client,
+                                        }))
+                                        .unwrap();
+                                }
                             }
                             false => {
                                 let notify_resp = s
@@ -461,12 +472,12 @@ impl Node {
                                 None => {}
                             }
                             successor
-                                .send
-                                .send(successor::SuccessorData {
+                                .0
+                                .send(Some(Succ {
                                     addr: p.addr,
                                     hash: p.hash,
                                     client: pred_client,
-                                })
+                                }))
                                 .unwrap()
                         }
                     }
@@ -500,7 +511,7 @@ impl Node {
                 if succesor.0 == fix_fingers_addr {
                     continue;
                 }
-                if let Some(s) = { finger.recv.borrow().clone() } {
+                if let Some(s) = { finger.1.borrow().clone() } {
                     if s.addr == succesor.0 {
                         continue;
                     }
@@ -510,12 +521,12 @@ impl Node {
                     NodeServiceClient::connect(format!("http://{}", succesor.0)).await
                 {
                     finger
-                        .send
-                        .send(successor::SuccessorData {
+                        .0
+                        .send(Some(Succ {
                             addr: succesor.0,
                             hash: succesor.1,
                             client,
-                        })
+                        }))
                         .unwrap();
                 }
             }
@@ -525,18 +536,18 @@ impl Node {
     pub async fn find_succ(
         self_addr: String,
         self_hash: U256,
-        finger_table: &Vec<Successor>,
+        finger_table: &Vec<(watch::Sender<Option<Succ>>, watch::Receiver<Option<Succ>>)>,
         hash: &U256,
     ) -> (String, U256) {
         let mut successor = (self_addr, self_hash);
 
-        let maybe_succ = { finger_table.get(0).unwrap().recv.borrow().clone() };
+        let maybe_succ = { finger_table.get(0).unwrap().1.borrow().clone() };
         if let Some(succ) = maybe_succ {
             if Self::within_range(&hash, &self_hash, &succ.hash) {
                 successor = (succ.addr, succ.hash);
             } else {
                 for finger in finger_table.iter().rev() {
-                    let maybe_s = { finger.recv.borrow().clone() };
+                    let maybe_s = { finger.1.borrow().clone() };
                     if let Some(mut s) = maybe_s {
                         if Self::within_range(&hash, &self_hash, &s.hash) {
                             let find_succ_resp = s
@@ -636,46 +647,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 join_resp.into_inner()
             };
 
-            Successor::spawn(
-                Some(successor::SuccessorData {
-                    addr: join_resp_data.succ_ip.clone(),
-                    hash: U256::from_be_bytes(join_resp_data.succ_id.try_into().unwrap()),
-                    client: NodeServiceClient::connect(format!(
-                        "http://{}",
-                        join_resp_data.succ_ip
-                    ))
+            watch::channel(Some(Succ {
+                addr: join_resp_data.succ_ip.clone(),
+                hash: U256::from_be_bytes(join_resp_data.succ_id.try_into().unwrap()),
+                client: NodeServiceClient::connect(format!("http://{}", join_resp_data.succ_ip))
                     .await
                     .unwrap(),
-                }),
-                &mut task_join_set,
-            )
+            }))
         }
-        None => Successor::spawn(None, &mut task_join_set),
+        None => watch::channel(None),
     };
 
     let mut succs = vec![first_succ];
     for _ in 1..256 {
-        succs.push(Successor::spawn(None, &mut task_join_set));
+        succs.push(watch::channel(None));
     }
 
-    let pred = Predecessor::spawn(&mut task_join_set);
+    let pred = watch::channel(None);
 
     let node = Node::new(
         addr_string,
-        Arc::new(succs),
-        Arc::new(pred),
+        succs,
+        pred,
         Arc::new(RwLock::new(BTreeMap::<U256, Quote>::new())),
     );
 
     node.start_periodics(stab_freq, fix_fing_freq, &mut task_join_set);
 
-    // TODO: also figure out the orders of these awaits
-    // or if we should even do them
-    Server::builder()
-        .add_service(NodeServiceServer::new(node))
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await
-        .unwrap();
+    task_join_set.spawn(async move {
+        Server::builder()
+            .add_service(NodeServiceServer::new(node))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap()
+    });
 
     task_join_set.join_all().await;
 

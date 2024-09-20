@@ -47,8 +47,10 @@ pub struct Settings {
 pub enum WsSendMessage {
     PollData {
         nodes: Vec<NodeState>,
-        avg_get_path_len: f32,
-        avg_set_path_len: f32,
+        total_get_len: u32,
+        total_set_len: u32,
+        total_gets: u32,
+        total_sets: u32,
         popular_quotes: Vec<JsonQuote>,
     },
     Ctrl(CtrlStatus),

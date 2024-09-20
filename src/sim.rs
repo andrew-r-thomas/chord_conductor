@@ -32,7 +32,7 @@ impl Sim {
     pub async fn start(settings: Settings, message_send: mpsc::Sender<WsSendMessage>) -> Self {
         let cancel_token = CancellationToken::new();
 
-        let (pool_send, pool_recv) = mpsc::unbounded_channel::<PoolRequest>();
+        let (pool_send, pool_recv) = mpsc::unbounded_channel::<oneshot::Sender<JsonQuote>>();
         let pool_task_token = cancel_token.clone();
         let mut task_tracker = TaskTracker::new();
         task_tracker.spawn(async move {
@@ -104,14 +104,13 @@ impl Sim {
         self.task_tracker.wait().await;
     }
 
-    async fn data_pool_task(mut pool_recv: UnboundedReceiver<PoolRequest>) {
+    async fn data_pool_task(mut pool_recv: UnboundedReceiver<oneshot::Sender<JsonQuote>>) {
         let mut rdr =
             csv_async::AsyncReader::from_reader(File::open("./quotes.csv").await.unwrap());
         let mut records = rdr.records();
         while let Some(request) = pool_recv.recv().await {
             let record = records.next().await.unwrap().unwrap();
             request
-                .send
                 .send(JsonQuote {
                     quote: record[0].into(),
                     author: record[1].into(),
@@ -149,41 +148,28 @@ impl Sim {
                 });
             }
 
-            let (popular_quotes, avg_get_path_len, avg_set_path_len) = {
-                let mut popular_quotes = vec![];
+            let mut popular_quotes = vec![];
+            {
+                let quotes = quotes.read().await;
+                for (quote, _) in quotes
+                    .iter()
+                    .sorted_by(|a, b| b.0.gets.cmp(&a.0.gets))
+                    .zip(0..5)
                 {
-                    let quotes = quotes.read().await;
-                    for (quote, _) in quotes
-                        .iter()
-                        .sorted_by(|a, b| b.0.gets.cmp(&a.0.gets))
-                        .zip(0..3)
-                    {
-                        popular_quotes.push(quote.0.clone());
-                    }
-
-                    if let Some(p) = popular_quotes.last_chunk::<3>() {
-                        popular_quotes = p.to_vec();
-                    }
+                    popular_quotes.push(quote.0.clone());
                 }
+            }
 
-                let avg_get_path_len = {
-                    let gets_data = gets.borrow();
-                    gets_data.0 as f32 / gets_data.1 as f32
-                };
-                let avg_set_path_len = {
-                    let sets_data = sets.borrow();
-                    sets_data.0 as f32 / sets_data.1 as f32
-                };
-
-                (popular_quotes, avg_get_path_len, avg_set_path_len)
-            };
-
+            let gets_data = *gets.borrow();
+            let sets_data = *sets.borrow();
             message_send
                 .send(WsSendMessage::PollData {
                     nodes,
                     popular_quotes,
-                    avg_get_path_len,
-                    avg_set_path_len,
+                    total_get_len: gets_data.0,
+                    total_gets: gets_data.1,
+                    total_set_len: sets_data.0,
+                    total_sets: sets_data.1,
                 })
                 .await
                 .unwrap();
@@ -192,7 +178,7 @@ impl Sim {
 
     async fn spawn_node(
         join_addr: Option<String>,
-        pool_sender: mpsc::UnboundedSender<PoolRequest>,
+        pool_sender: mpsc::UnboundedSender<oneshot::Sender<JsonQuote>>,
         set_quotes: Arc<RwLock<Vec<(JsonQuote, Vec<u8>)>>>,
         activity_level: u64,
         get_affinity: u64,
@@ -233,16 +219,16 @@ impl Sim {
 
         let mut task_client = client.clone();
         let client_task = async move {
-            // TODO: figure out a better way to do this
             let _kill_guard = node;
+
             let mut ticker = interval(Duration::from_millis(activity_level.into()));
+            ticker.tick().await;
+
             let weights = [get_affinity, 100 - get_affinity];
             let index = WeightedIndex::new(weights).unwrap();
-            ticker.tick().await;
+
             loop {
                 ticker.tick().await;
-                // TODO: also change this to only get values it knows is in there, or something
-
                 let i = { index.sample(&mut rand::thread_rng()) };
                 match i {
                     0 => {
@@ -269,7 +255,7 @@ impl Sim {
                     }
                     1 => {
                         let (q_send, q_recv) = oneshot::channel::<JsonQuote>();
-                        pool_sender.send(PoolRequest { send: q_send }).unwrap();
+                        pool_sender.send(q_send).unwrap();
                         if let Ok(quote) = q_recv.await {
                             let set_resp = task_client
                                 .set(Request::new(crate::node::SetRequest {
@@ -310,8 +296,4 @@ impl Sim {
 struct NodeHandle {
     pub addr: String,
     pub client: NodeServiceClient<Channel>,
-}
-
-struct PoolRequest {
-    send: oneshot::Sender<JsonQuote>,
 }
