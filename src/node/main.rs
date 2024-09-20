@@ -5,7 +5,7 @@ use itertools::Itertools;
 use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
-    sync::{watch, RwLock},
+    sync::RwLock,
     task::JoinSet,
     time::{interval, Duration},
 };
@@ -25,24 +25,10 @@ use node_service::{
     set_request::Setter,
     Data, FindSuccRequest, FindSuccResponse, GetRequest, GetResponse, GetStateRequest,
     GetStateResponse, JoinRequest, JoinResponse, NotifyRequest, NotifyResponse, PredRequest,
-    PredResponse, Quote, SetRequest, SetResponse, UpdateFixFingFreqRequest,
-    UpdateFixFingFreqResponse, UpdateStabFreqRequest, UpdateStabFreqResponse,
+    PredResponse, Quote, SetRequest, SetResponse,
 };
 use predecessor::Predecessor;
 use successor::Successor;
-
-/*
-ok so what do we want to do here
-
-make things configurable live:
-- number of nodes
-- failure rate of nodes
-- frequency of periodics
-
-node failure
-node planed leave
-data loss
-*/
 
 #[derive(Debug)]
 pub struct Node {
@@ -51,8 +37,6 @@ pub struct Node {
     data: Arc<RwLock<BTreeMap<U256, Quote>>>,
     pred: Arc<Predecessor>,
     finger_table: Arc<Vec<Successor>>,
-    stab_freq_send: watch::Sender<u64>,
-    fix_fing_freq_send: watch::Sender<u64>,
 }
 
 #[tonic::async_trait]
@@ -276,10 +260,10 @@ impl NodeService for Node {
 
                 self.pred
                     .send
-                    .send(predecessor::PredecessorData {
+                    .send(Some(predecessor::PredecessorData {
                         addr: request_message.addr,
                         hash,
-                    })
+                    }))
                     .unwrap();
 
                 Ok(Response::new(NotifyResponse {
@@ -296,10 +280,10 @@ impl NodeService for Node {
 
                     self.pred
                         .send
-                        .send(predecessor::PredecessorData {
+                        .send(Some(predecessor::PredecessorData {
                             addr: request_message.addr,
                             hash,
-                        })
+                        }))
                         .unwrap();
 
                     Ok(Response::new(NotifyResponse {
@@ -334,24 +318,6 @@ impl NodeService for Node {
             fingers,
         }))
     }
-
-    async fn update_stab_freq(
-        &self,
-        request: Request<UpdateStabFreqRequest>,
-    ) -> Result<Response<UpdateStabFreqResponse>, Status> {
-        let request_data = request.into_inner();
-        self.stab_freq_send.send(request_data.new).unwrap();
-        Ok(Response::new(UpdateStabFreqResponse {}))
-    }
-
-    async fn update_fix_fing_freq(
-        &self,
-        request: Request<UpdateFixFingFreqRequest>,
-    ) -> Result<Response<UpdateFixFingFreqResponse>, Status> {
-        let request_data = request.into_inner();
-        self.fix_fing_freq_send.send(request_data.new).unwrap();
-        Ok(Response::new(UpdateFixFingFreqResponse {}))
-    }
 }
 
 impl Node {
@@ -360,8 +326,6 @@ impl Node {
         finger_table: Arc<Vec<Successor>>,
         pred: Arc<Predecessor>,
         data: Arc<RwLock<BTreeMap<U256, Quote>>>,
-        stab_freq_send: watch::Sender<u64>,
-        fix_fing_freq_send: watch::Sender<u64>,
     ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(addr.as_bytes());
@@ -372,8 +336,6 @@ impl Node {
             id,
             addr,
             data,
-            stab_freq_send,
-            fix_fing_freq_send,
             finger_table,
         }
     }
@@ -382,8 +344,6 @@ impl Node {
         &self,
         stabilize_freq: u64,
         fix_fingers_freq: u64,
-        stab_freq_recv: watch::Receiver<u64>,
-        fix_fing_freq_recv: watch::Receiver<u64>,
         join_set: &mut JoinSet<()>,
     ) {
         let stabilize_task_id = self.id.clone();
@@ -395,14 +355,8 @@ impl Node {
         join_set.spawn(async move {
             // stabilize
             let mut ticker = interval(Duration::from_millis(stabilize_freq));
-            let mut stab_freq = stabilize_freq;
             loop {
                 ticker.tick().await;
-                let current_stab_freq = { *stab_freq_recv.borrow() };
-                if current_stab_freq != stab_freq {
-                    ticker = interval(Duration::from_millis(current_stab_freq));
-                    stab_freq = current_stab_freq;
-                }
                 let pred_read = { stabilize_task_pred.recv.borrow().clone() };
 
                 let successor = stabilize_finger_table.get(0).unwrap();
@@ -527,14 +481,8 @@ impl Node {
             // fix fingers
             let mut next: u32 = 1;
             let mut ticker = interval(Duration::from_millis(fix_fingers_freq));
-            let mut fix_fing_freq = fix_fingers_freq;
             loop {
                 ticker.tick().await;
-                let current_fix_fing_freq = { *fix_fing_freq_recv.borrow() };
-                if current_fix_fing_freq != fix_fing_freq {
-                    ticker = interval(Duration::from_millis(current_fix_fing_freq));
-                    fix_fing_freq = current_fix_fing_freq;
-                }
                 next += 1;
                 if next > 255 {
                     next = 1;
@@ -674,8 +622,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stab_freq: u64 = args.get(1).unwrap().parse().unwrap();
     let fix_fing_freq: u64 = args.get(2).unwrap().parse().unwrap();
-    let (stab_freq_send, stab_freq_recv) = watch::channel(stab_freq);
-    let (fix_fing_freq_send, fix_fing_freq_recv) = watch::channel(fix_fing_freq);
 
     let first_succ = match args.get(3) {
         Some(join_addr) => {
@@ -719,17 +665,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(succs),
         Arc::new(pred),
         Arc::new(RwLock::new(BTreeMap::<U256, Quote>::new())),
-        stab_freq_send,
-        fix_fing_freq_send,
     );
 
-    node.start_periodics(
-        stab_freq,
-        fix_fing_freq,
-        stab_freq_recv,
-        fix_fing_freq_recv,
-        &mut task_join_set,
-    );
+    node.start_periodics(stab_freq, fix_fing_freq, &mut task_join_set);
 
     // TODO: also figure out the orders of these awaits
     // or if we should even do them

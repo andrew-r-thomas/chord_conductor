@@ -6,11 +6,10 @@ use tokio::{
     },
     task::JoinSet,
 };
-use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct Predecessor {
-    pub send: UnboundedSender<PredecessorData>,
+    pub send: UnboundedSender<Option<PredecessorData>>,
     pub recv: Receiver<Option<PredecessorData>>,
 }
 
@@ -23,12 +22,11 @@ pub struct PredecessorData {
 impl Predecessor {
     pub fn spawn(join_set: &mut JoinSet<()>) -> Self {
         let (watch_send, watch_recv) = watch::channel::<Option<PredecessorData>>(None);
-        let (mpsc_send, mut mpsc_recv) = mpsc::unbounded_channel::<PredecessorData>();
+        let (mpsc_send, mut mpsc_recv) = mpsc::unbounded_channel::<Option<PredecessorData>>();
 
         join_set.spawn(async move {
             while let Some(p) = mpsc_recv.recv().await {
-                info!("got a new pred: {}", p.addr);
-                watch_send.send_modify(|current| *current = Some(p));
+                watch_send.send_modify(|current| *current = p);
             }
         });
 

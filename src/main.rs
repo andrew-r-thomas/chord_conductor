@@ -9,14 +9,13 @@ use axum::{
 };
 use futures::{stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
-use sim::Sim;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinSet};
 
-pub mod client_handler;
 pub mod sim;
 mod node {
     tonic::include_proto!("node");
 }
+use sim::Sim;
 
 #[tokio::main]
 async fn main() {
@@ -33,7 +32,6 @@ async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
 enum WsRecvMessage {
     Start(Settings),
     Stop,
-    Update(Settings),
 }
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Settings {
@@ -60,7 +58,6 @@ pub enum WsSendMessage {
 pub enum CtrlStatus {
     Started,
     Stopped,
-    Updated,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -114,15 +111,6 @@ async fn handle_socket(mut socket: WebSocket) {
                         active_sim = None;
                         t_message_send
                             .send(WsSendMessage::Ctrl(CtrlStatus::Stopped))
-                            .await
-                            .unwrap();
-                    }
-                }
-                WsRecvMessage::Update(settings) => {
-                    if let Some(a_s) = &mut active_sim {
-                        a_s.update(settings).await;
-                        t_message_send
-                            .send(WsSendMessage::Ctrl(CtrlStatus::Updated))
                             .await
                             .unwrap();
                     }

@@ -9,7 +9,7 @@ use tokio::{
     process::Command,
     sync::{
         mpsc::{self, UnboundedReceiver},
-        watch, RwLock,
+        RwLock,
     },
     time::{interval, sleep, Duration},
 };
@@ -25,8 +25,6 @@ use crate::{
 pub struct Sim {
     cancel_token: CancellationToken,
     task_tracker: TaskTracker,
-    poll_rate_send: watch::Sender<u64>,
-    node_settings_send: watch::Sender<(u64, u64, u64, u64)>,
 }
 
 impl Sim {
@@ -46,12 +44,6 @@ impl Sim {
 
         let tracked_quotes = Arc::new(RwLock::new(vec![]));
 
-        let (node_settings_send, node_settings_recv) = watch::channel((
-            settings.activity_level,
-            settings.get_affinity,
-            settings.stabilize_freq,
-            settings.fix_finger_freq,
-        ));
         let mut prev_addr = None;
         let nodes = Arc::new(RwLock::new(BTreeMap::new()));
         {
@@ -67,7 +59,6 @@ impl Sim {
                     settings.fix_finger_freq,
                     &mut task_tracker,
                     cancel_token.clone(),
-                    node_settings_recv.clone(),
                 )
                 .await;
 
@@ -76,13 +67,14 @@ impl Sim {
             }
         }
 
-        let (poll_rate_send, poll_rate_recv) = watch::channel(settings.poll_rate);
         let poll_task_token = cancel_token.clone();
+        let poll_task_nodes = nodes.clone();
+        let poll_task_tracked_quotes = tracked_quotes.clone();
         task_tracker.spawn(async move {
             tokio::select! {
                 _ = poll_task_token.cancelled() => {
                 }
-                _ = Self::poll_task(nodes, tracked_quotes.clone(), poll_rate_recv, settings.poll_rate, message_send) => {}
+                _ = Self::poll_task(poll_task_nodes, poll_task_tracked_quotes, settings.poll_rate, message_send) => {}
             }
         });
 
@@ -91,26 +83,12 @@ impl Sim {
         Self {
             cancel_token,
             task_tracker,
-            poll_rate_send,
-            node_settings_send,
         }
     }
 
     pub async fn stop(&self) {
         self.cancel_token.cancel();
         self.task_tracker.wait().await;
-    }
-
-    pub async fn update(&mut self, settings: Settings) {
-        self.poll_rate_send.send(settings.poll_rate).unwrap();
-        self.node_settings_send
-            .send((
-                settings.activity_level,
-                settings.get_affinity,
-                settings.stabilize_freq,
-                settings.fix_finger_freq,
-            ))
-            .unwrap();
     }
 
     async fn data_pool_task(mut pool_recv: UnboundedReceiver<PoolRequest>) {
@@ -132,21 +110,14 @@ impl Sim {
     async fn poll_task(
         clients: Arc<RwLock<BTreeMap<Vec<u8>, NodeHandle>>>,
         quotes: Arc<RwLock<Vec<TrackedQuote>>>,
-        poll_rate_recv: watch::Receiver<u64>,
         poll_rate: u64,
         message_send: mpsc::Sender<WsSendMessage>,
     ) {
         let mut ticker = interval(Duration::from_millis(poll_rate));
-        let mut p_rate = poll_rate;
         loop {
             ticker.tick().await;
-            let current_p_rate = { *poll_rate_recv.borrow() };
-            if current_p_rate != p_rate {
-                ticker = interval(Duration::from_millis(current_p_rate));
-                p_rate = current_p_rate;
-            }
-            let mut nodes = vec![];
 
+            let mut nodes = vec![];
             // PERF: could maybe do this concurrently
             let mut clients_write = clients.write().await;
             for c in clients_write.values_mut() {
@@ -217,7 +188,6 @@ impl Sim {
         fix_fingers_freq: u64,
         task_tracker: &mut TaskTracker,
         cancel_token: CancellationToken,
-        settings_recv: watch::Receiver<(u64, u64, u64, u64)>,
     ) -> (Vec<u8>, NodeHandle) {
         let mut node = match join_addr {
             Some(ja) => Command::new("./target/debug/node")
@@ -252,45 +222,11 @@ impl Sim {
             // TODO: figure out a better way to do this
             let _kill_guard = node;
             let mut ticker = interval(Duration::from_millis(activity_level.into()));
-            let init_weights = [get_affinity, 100 - get_affinity];
-            let mut index = WeightedIndex::new(init_weights).unwrap();
-            let mut settings = (
-                activity_level,
-                get_affinity,
-                stabilize_freq,
-                fix_fingers_freq,
-            );
+            let weights = [get_affinity, 100 - get_affinity];
+            let index = WeightedIndex::new(weights).unwrap();
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let current_settings = { *settings_recv.borrow() };
-                if current_settings.0 != settings.0 {
-                    ticker = interval(Duration::from_millis(current_settings.0));
-                    settings.0 = current_settings.0;
-                }
-                if current_settings.1 != settings.1 {
-                    let new_weights = [(0, &current_settings.1), (1, &(100 - current_settings.1))];
-                    index.update_weights(&new_weights).unwrap();
-                    settings.1 = current_settings.1;
-                }
-                if current_settings.2 != settings.2 {
-                    task_client
-                        .update_stab_freq(Request::new(crate::node::UpdateStabFreqRequest {
-                            new: current_settings.2,
-                        }))
-                        .await
-                        .unwrap();
-                    settings.2 = current_settings.2;
-                }
-                if current_settings.3 != settings.3 {
-                    task_client
-                        .update_fix_fing_freq(Request::new(crate::node::UpdateFixFingFreqRequest {
-                            new: current_settings.3,
-                        }))
-                        .await
-                        .unwrap();
-                    settings.3 = current_settings.3;
-                }
                 // TODO: also change this to only get values it knows is in there, or something
 
                 let i = { index.sample(&mut rand::thread_rng()) };
@@ -347,8 +283,7 @@ impl Sim {
 
         task_tracker.spawn(async move {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
-                }
+                _ = cancel_token.cancelled() => {}
                 _ = client_task => {}
             }
         });

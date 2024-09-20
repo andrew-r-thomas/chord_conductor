@@ -12,8 +12,6 @@ service NodeService {
 	rpc Notify (NotifyRequest) returns (NotifyResponse);
 
 	rpc GetState (GetStateRequest) returns (GetStateResponse);
-	rpc UpdateStabFreq (UpdateStabFreqRequest) returns (UpdateStabFreqResponse);
-	rpc UpdateFixFingFreq (UpdateFixFingFreqRequest) returns (UpdateFixFingFreqResponse);
 }
 
 message Quote {
@@ -83,13 +81,3 @@ message FindSuccResponse {
 	string addr = 1;
 	bytes hash = 2;
 }
-
-message UpdateStabFreqRequest {
-	uint64 new = 1;
-}
-message UpdateStabFreqResponse {}
-
-message UpdateFixFingFreqRequest {
-	uint64 new = 1;
-}
-message UpdateFixFingFreqResponse {}
