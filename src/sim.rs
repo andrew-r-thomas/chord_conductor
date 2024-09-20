@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, process::Stdio, sync::Arc};
 
 use futures::channel::oneshot;
+use itertools::Itertools;
 use rand::{distributions::WeightedIndex, prelude::Distribution, seq::SliceRandom};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -9,7 +10,7 @@ use tokio::{
     process::Command,
     sync::{
         mpsc::{self, UnboundedReceiver},
-        RwLock,
+        watch, RwLock,
     },
     time::{interval, sleep, Duration},
 };
@@ -19,7 +20,7 @@ use tonic::{transport::Channel, Request};
 
 use crate::{
     node::{node_service_client::NodeServiceClient, GetStateRequest, Quote},
-    JsonQuote, NodeState, Settings, TrackedQuote, WsSendMessage,
+    JsonQuote, NodeState, Settings, WsSendMessage,
 };
 
 pub struct Sim {
@@ -44,6 +45,9 @@ impl Sim {
 
         let tracked_quotes = Arc::new(RwLock::new(vec![]));
 
+        let (gets_send, gets_recv) = watch::channel((0, 0));
+        let (sets_send, sets_recv) = watch::channel((0, 0));
+
         let mut prev_addr = None;
         let nodes = Arc::new(RwLock::new(BTreeMap::new()));
         {
@@ -59,6 +63,8 @@ impl Sim {
                     settings.fix_finger_freq,
                     &mut task_tracker,
                     cancel_token.clone(),
+                    gets_send.clone(),
+                    sets_send.clone(),
                 )
                 .await;
 
@@ -74,7 +80,14 @@ impl Sim {
             tokio::select! {
                 _ = poll_task_token.cancelled() => {
                 }
-                _ = Self::poll_task(poll_task_nodes, poll_task_tracked_quotes, settings.poll_rate, message_send) => {}
+                _ = Self::poll_task(
+                    poll_task_nodes,
+                    poll_task_tracked_quotes,
+                    settings.poll_rate,
+                    message_send,
+                    gets_recv.clone(),
+                    sets_recv.clone()
+                ) => {}
             }
         });
 
@@ -102,6 +115,7 @@ impl Sim {
                 .send(JsonQuote {
                     quote: record[0].into(),
                     author: record[1].into(),
+                    gets: 0,
                 })
                 .unwrap();
         }
@@ -109,18 +123,19 @@ impl Sim {
 
     async fn poll_task(
         clients: Arc<RwLock<BTreeMap<Vec<u8>, NodeHandle>>>,
-        quotes: Arc<RwLock<Vec<TrackedQuote>>>,
+        quotes: Arc<RwLock<Vec<(JsonQuote, Vec<u8>)>>>,
         poll_rate: u64,
         message_send: mpsc::Sender<WsSendMessage>,
+        gets: watch::Receiver<(u32, u32)>,
+        sets: watch::Receiver<(u32, u32)>,
     ) {
         let mut ticker = interval(Duration::from_millis(poll_rate));
         loop {
             ticker.tick().await;
 
+            let clients_read = { clients.read().await.clone() };
             let mut nodes = vec![];
-            // PERF: could maybe do this concurrently
-            let mut clients_write = clients.write().await;
-            for c in clients_write.values_mut() {
+            for mut c in clients_read.iter().map(|c| c.1.clone()) {
                 let get_state_resp = c
                     .client
                     .get_state(Request::new(GetStateRequest {}))
@@ -134,34 +149,31 @@ impl Sim {
                 });
             }
 
-            // PERF: yikes
             let (popular_quotes, avg_get_path_len, avg_set_path_len) = {
                 let mut popular_quotes = vec![];
-                let mut avg_get_path_len = 0;
-                let mut avg_set_path_len = 0;
-                let mut highest_pop = 0;
-
-                let quotes = quotes.read().await;
-                for quote in quotes.iter() {
-                    if quote.gets > highest_pop {
-                        popular_quotes.push(quote.quote.clone());
-                        highest_pop = quote.gets;
+                {
+                    let quotes = quotes.read().await;
+                    for (quote, _) in quotes
+                        .iter()
+                        .sorted_by(|a, b| b.0.gets.cmp(&a.0.gets))
+                        .zip(0..3)
+                    {
+                        popular_quotes.push(quote.0.clone());
                     }
-                    if let Some(g) = quote.total_get_path_len.checked_div(quote.gets) {
-                        avg_get_path_len += g;
+
+                    if let Some(p) = popular_quotes.last_chunk::<3>() {
+                        popular_quotes = p.to_vec();
                     }
-                    avg_set_path_len += quote.set_path_len;
                 }
 
-                if let Some(avg_set) = avg_set_path_len.checked_div(quotes.len() as u32) {
-                    avg_set_path_len = avg_set;
-                }
-                if let Some(avg_get) = avg_get_path_len.checked_div(quotes.len() as u32) {
-                    avg_get_path_len = avg_get;
-                }
-                if let Some(p) = popular_quotes.last_chunk::<3>() {
-                    popular_quotes = p.to_vec();
-                }
+                let avg_get_path_len = {
+                    let gets_data = gets.borrow();
+                    gets_data.0 as f32 / gets_data.1 as f32
+                };
+                let avg_set_path_len = {
+                    let sets_data = sets.borrow();
+                    sets_data.0 as f32 / sets_data.1 as f32
+                };
 
                 (popular_quotes, avg_get_path_len, avg_set_path_len)
             };
@@ -181,13 +193,15 @@ impl Sim {
     async fn spawn_node(
         join_addr: Option<String>,
         pool_sender: mpsc::UnboundedSender<PoolRequest>,
-        set_quotes: Arc<RwLock<Vec<TrackedQuote>>>,
+        set_quotes: Arc<RwLock<Vec<(JsonQuote, Vec<u8>)>>>,
         activity_level: u64,
         get_affinity: u64,
         stabilize_freq: u64,
         fix_fingers_freq: u64,
         task_tracker: &mut TaskTracker,
         cancel_token: CancellationToken,
+        gets_send: watch::Sender<(u32, u32)>,
+        sets_send: watch::Sender<(u32, u32)>,
     ) -> (Vec<u8>, NodeHandle) {
         let mut node = match join_addr {
             Some(ja) => Command::new("./target/debug/node")
@@ -238,15 +252,18 @@ impl Sim {
                         if let Some(quote) = q {
                             let get_resp = task_client
                                 .get(Request::new(crate::node::GetRequest {
-                                    key: quote.hash.clone(),
+                                    key: quote.1.clone(),
                                 }))
                                 .await
                                 .unwrap();
 
                             let get_data = get_resp.into_inner();
                             if let Some(_) = get_data.result {
-                                quote.gets += 1;
-                                quote.total_get_path_len += get_data.path_len;
+                                quote.0.gets += 1;
+                                gets_send.send_modify(|(total_path_len, total_gets)| {
+                                    *total_path_len += get_data.path_len;
+                                    *total_gets += 1;
+                                });
                             }
                         }
                     }
@@ -266,13 +283,10 @@ impl Sim {
                                 .unwrap();
 
                             let set_data = set_resp.into_inner();
-                            set_quotes.write().await.push(TrackedQuote {
-                                quote,
-                                hash: set_data.hash,
-                                gets: 0,
-                                total_get_path_len: 0,
-                                // TODO: this number wont change as is
-                                set_path_len: set_data.path_len,
+                            set_quotes.write().await.push((quote, set_data.hash));
+                            sets_send.send_modify(|(total_path_len, total_sets)| {
+                                *total_path_len += set_data.path_len;
+                                *total_sets += 1;
                             });
                         }
                     }
@@ -292,6 +306,7 @@ impl Sim {
     }
 }
 
+#[derive(Clone)]
 struct NodeHandle {
     pub addr: String,
     pub client: NodeServiceClient<Channel>,

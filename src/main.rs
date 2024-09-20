@@ -47,8 +47,8 @@ pub struct Settings {
 pub enum WsSendMessage {
     PollData {
         nodes: Vec<NodeState>,
-        avg_get_path_len: u32,
-        avg_set_path_len: u32,
+        avg_get_path_len: f32,
+        avg_set_path_len: f32,
         popular_quotes: Vec<JsonQuote>,
     },
     Ctrl(CtrlStatus),
@@ -64,6 +64,7 @@ pub enum CtrlStatus {
 pub struct JsonQuote {
     quote: String,
     author: String,
+    gets: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -71,14 +72,6 @@ pub struct NodeState {
     addr: String,
     fingers: Vec<String>,
     len: u32,
-}
-
-pub struct TrackedQuote {
-    quote: JsonQuote,
-    hash: Vec<u8>,
-    total_get_path_len: u32,
-    set_path_len: u32,
-    gets: u32,
 }
 
 async fn handle_socket(mut socket: WebSocket) {
