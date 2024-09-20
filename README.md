@@ -32,7 +32,7 @@ the chord protocol is a method for knowing which node has a piece of data, based
 on both the data and a unique piece of information about the nodes (typically the ip address). the nodes are then placed on an ordered "ring" based on their hash, and are responsible
 for data that hashes between their predecessor and themselves.
 
-[chord image]
+<img width="812" alt="Screenshot 2024-09-20 at 3 43 36 PM" src="https://github.com/user-attachments/assets/fca9da3a-1139-4403-a174-e63499d73f94">
 
 the rest of the details about the chord protocol can be found in the [paper](https://pdos.csail.mit.edu/papers/ton:chord/paper-ton.pdf) as well as the code. for this section, i want to focus on a couple of technical decisions.
 
