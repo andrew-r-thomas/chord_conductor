@@ -18,11 +18,11 @@ then run the conductor with
 cargo run --bin conductor
 ```
 
-the client can be found in the `client` folder, and can be run with
+the client can be found in the `client` folder, and after installing dependencies, can be run with
 ```bash
 bun run dev
 ```
-the client will be on `localhost:4321`
+the client will be available at `localhost:4321`
 
 ## Demo
 
