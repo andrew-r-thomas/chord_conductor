@@ -7,6 +7,10 @@ edition = "2021"
 name = "node"
 path = "src/node/main.rs"
 
+[[bin]]
+name = "conductor"
+path = "src/conductor/main.rs"
+
 [dependencies]
 axum = { version = "0.7.5", features = ["ws"] }
 axum-extra = { version = "0.9.3", features = ["typed-header"] }
